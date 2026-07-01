@@ -1,0 +1,15 @@
+---
+// Pass-through of Starlight's default Head.
+//
+// NOTE: We previously added Astro's <ClientRouter /> here for SPA-style
+// no-flash navigation. It broke Pagefind search: Starlight initialises the
+// search UI on first load, but a view-transition swap inserts a fresh, empty
+// search dialog without re-running that init, so search came up blank on every
+// soft-navigated page. Full-page navigation re-initialises search each time,
+// so we keep the default behaviour. If SPA nav is wanted back, it must come
+// with a Search component override that uses `transition:persist` (or an
+// `astro:page-load` re-init) so the search UI survives the swap.
+import Default from "@astrojs/starlight/components/Head.astro";
+---
+
+<Default><slot /></Default>

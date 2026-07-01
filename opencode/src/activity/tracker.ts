@@ -1,0 +1,131 @@
+import type { SessionStore } from "../storage/session-store.js";
+
+const WINDOW_SIZE = 10;
+const PRUNE_THRESHOLD = 30;
+const PRUNE_KEEP = 20;
+
+// Tool names span two ecosystems: Claude Code (PascalCase: Read/Write/Edit/Agent)
+// and OpenCode native (lowercase: read/write/edit/task/grep/glob/bash). Both must
+// be recognized or activity tracking silently no-ops on whichever host is in use.
+const EDIT_TOOLS = new Set(["Edit", "Write", "MultiEdit", "NotebookEdit", "file_write", "file_edit", "edit", "write"]);
+const READ_TOOLS = new Set(["Read", "Glob", "Grep", "file_read", "find", "read", "grep", "glob"]);
+const AGENT_TOOLS = new Set(["Agent", "TaskCreate", "TaskUpdate", "TaskGet", "TaskList", "task"]);
+
+// Focused sets for the hooks that record a single file path / dispatch. The
+// writers are exactly EDIT_TOOLS; reads/dispatches are narrower than the broad
+// classifier sets (no Glob/Grep, no Task* status tools).
+const FILE_READ_TOOLS = new Set(["Read", "file_read", "read"]);
+const AGENT_DISPATCH_TOOLS = new Set(["Agent", "TaskCreate", "task"]);
+
+export const isFileReadTool = (tool: string): boolean => FILE_READ_TOOLS.has(tool);
+export const isFileWriteTool = (tool: string): boolean => EDIT_TOOLS.has(tool);
+export const isAgentDispatchTool = (tool: string): boolean => AGENT_DISPATCH_TOOLS.has(tool);
+
+/** Read a file-path argument under either naming convention (filePath | file_path). */
+export function extractFilePath(args: unknown): string | null {
+  if (!args || typeof args !== "object") return null;
+  const a = args as Record<string, unknown>;
+  const p = a.filePath ?? a.file_path;
+  return typeof p === "string" ? p : null;
+}
+
+// Module-level prune cadence: run the COUNT+DELETE only every PRUNE_THRESHOLD
+// calls instead of COUNT(*) on every single tool call (cheap, keeps the table
+// bounded). Shared across sessions, which only affects which call triggers a prune.
+let callsSincePrune = 0;
+
+const INFRA_BASH_RE =
+  /\b(?:systemctl|nginx|docker|kubectl|service|daemon|launchctl|brew|apt|apt-get|yum|dnf|pacman)\b/;
+const GIT_WRITE_RE = /\bgit\s+(?:push|pull|merge|rebase|cherry-pick|tag)\b/;
+const INSTALL_RE = /\b(?:pip|npm|pnpm|yarn|bun|cargo|go)\s+(?:install|add|update|upgrade)\b/;
+
+export type ToolBucket =
+  | "edit"
+  | "read"
+  | "agent"
+  | "mcp"
+  | "bash_infra"
+  | "bash_git"
+  | "bash_install"
+  | "bash_other"
+  | "web"
+  | "other";
+
+export type SessionMode = "code" | "debug" | "review" | "infra" | "general";
+
+export function classifyTool(toolName: string, command: string = ""): ToolBucket {
+  if (EDIT_TOOLS.has(toolName)) return "edit";
+  if (READ_TOOLS.has(toolName)) return "read";
+  if (AGENT_TOOLS.has(toolName)) return "agent";
+  if (toolName.startsWith("mcp__") || toolName.startsWith("mcp_")) return "mcp";
+  if (toolName === "Bash" || toolName === "shell" || toolName === "bash") {
+    if (INFRA_BASH_RE.test(command)) return "bash_infra";
+    if (GIT_WRITE_RE.test(command)) return "bash_git";
+    if (INSTALL_RE.test(command)) return "bash_install";
+    return "bash_other";
+  }
+  if (toolName === "WebSearch" || toolName === "WebFetch") return "web";
+  return "other";
+}
+
+export function detectMode(recentBuckets: ToolBucket[], hasRecentErrors: boolean = false): SessionMode {
+  if (recentBuckets.length < 3) return "general";
+
+  const editCount = recentBuckets.filter((b) => b === "edit").length;
+  const readCount = recentBuckets.filter((b) => b === "read").length;
+  const infraCount = recentBuckets.filter((b) =>
+    b === "bash_infra" || b === "bash_git" || b === "bash_install",
+  ).length;
+  const webCount = recentBuckets.filter((b) => b === "web").length;
+  const bashOther = recentBuckets.filter((b) => b === "bash_other").length;
+
+  if (infraCount >= 3) return "infra";
+  if (hasRecentErrors && readCount >= 3 && editCount <= 1) return "debug";
+  if (editCount >= 4) return "code";
+  if (readCount >= 4 && editCount === 0) return "review";
+  if (webCount >= 3) return "review";
+  if (editCount >= 2 && (bashOther >= 2 || readCount >= 2)) return "code";
+
+  return "general";
+}
+
+export function logToolUse(
+  store: SessionStore,
+  toolName: string,
+  command: string = "",
+  hasError: boolean = false,
+  resultSize: number = 0,
+): SessionMode | null {
+  try {
+    const bucket = classifyTool(toolName, command);
+    const db = store.connect();
+
+    db.run(
+      "INSERT INTO activity_log (tool_name, tool_bucket, has_error, result_size, timestamp) VALUES (?, ?, ?, ?, ?)",
+      [toolName.slice(0, 64), bucket, hasError ? 1 : 0, resultSize, Date.now() / 1000],
+    );
+
+    const rows = db
+      .query("SELECT tool_bucket, has_error FROM activity_log ORDER BY id DESC LIMIT ?")
+      .all(WINDOW_SIZE) as Array<{ tool_bucket: string; has_error: number }>;
+
+    // Prune on a fixed cadence instead of COUNT(*) every call.
+    if (++callsSincePrune >= PRUNE_THRESHOLD) {
+      callsSincePrune = 0;
+      db.run(
+        "DELETE FROM activity_log WHERE id NOT IN (SELECT id FROM activity_log ORDER BY id DESC LIMIT ?)",
+        [PRUNE_KEEP],
+      );
+    }
+
+    const recentBuckets = rows.map((r) => r.tool_bucket as ToolBucket);
+    const hasRecentErrors = rows.some((r) => r.has_error === 1);
+    const mode = detectMode(recentBuckets, hasRecentErrors);
+
+    store.setMeta("current_mode", mode);
+    return mode;
+  } catch (e) {
+    console.warn("[Token Optimizer] logToolUse failed:", e);
+    return null;
+  }
+}

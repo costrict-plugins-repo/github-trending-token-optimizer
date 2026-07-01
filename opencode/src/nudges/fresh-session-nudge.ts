@@ -1,0 +1,218 @@
+/**
+ * Fresh-session nudge: fires once per session when context is BOTH long
+ * (fill >= FRESH_NUDGE_MIN_FILL_PCT) AND degraded (quality < FRESH_NUDGE_QUALITY_THRESHOLD).
+ *
+ * Confidently reassures the user that Token Optimizer has checkpointed their
+ * active task so a fresh session resumes exactly where they stopped, and shows
+ * the concrete tokens they would reclaim by starting fresh now.
+ *
+ * Takes PRECEDENCE over the ordinary quality/compact nudge (the caller skips
+ * that when this fires — both messages would be noise).
+ *
+ * Ported from Python _maybe_fresh_session_nudge / _fresh_session_savings_estimate
+ * in skills/token-optimizer/scripts/measure.py.
+ */
+
+import { contextWindowForModel } from "../util/context-window.js";
+
+// ---------------------------------------------------------------------------
+// Per-model input rates ($/M tokens). Mirrors Python PRICING_TIERS["anthropic"]
+// and the non-Claude model table. Fallback is Sonnet at $3.00/M.
+// ---------------------------------------------------------------------------
+const MODEL_INPUT_RATES: Record<string, number> = {
+  // Anthropic Claude
+  fable: 10.0,
+  opus: 5.0,
+  sonnet: 3.0,
+  haiku: 1.0,
+  // GPT-5 family
+  "gpt-5.5-pro": 30.0,
+  "gpt-5.5": 5.0,
+  "gpt-5.4": 2.5,
+  "gpt-5.4-mini": 0.75,
+  "gpt-5.4-nano": 0.2,
+  "gpt-5.3-codex": 1.75,
+  "gpt-5.2-codex": 1.75,
+  "gpt-5.2": 1.75,
+  "gpt-5.1-codex-mini": 0.25,
+  "gpt-5.1-codex": 1.25,
+  "gpt-5.1": 1.25,
+  "gpt-5-codex": 1.25,
+  "gpt-5": 1.25,
+  "gpt-5-mini": 0.25,
+  "gpt-5-nano": 0.05,
+  // GPT-4 family
+  "gpt-4.1": 2.0,
+  "gpt-4.1-mini": 0.4,
+  "gpt-4.1-nano": 0.1,
+  "gpt-4o": 2.5,
+  "gpt-4o-mini": 0.15,
+  // OpenAI reasoning
+  "o3-pro": 20.0,
+  o3: 2.0,
+  "o3-mini": 1.1,
+  "o4-mini": 1.1,
+  // Google Gemini
+  "gemini-2.5-pro": 1.25,
+  "gemini-2.5-flash": 0.3,
+  "gemini-2.5-flash-lite": 0.1,
+  "gemini-2.0-flash": 0.1,
+  "gemini-2.0-flash-lite": 0.075,
+};
+
+/** Sonnet input rate used as the default fallback ($/M tokens). */
+const FALLBACK_INPUT_RATE_PER_MTOK = 3.0;
+
+/**
+ * Look up the API input rate ($/M tokens) for the given model.
+ * Substring-matches the lowercase model id against the table — same
+ * strategy as contextWindowForModel. Falls back to Sonnet ($3.00/M).
+ */
+export function modelInputRatePer1M(model?: string): number {
+  if (!model) return FALLBACK_INPUT_RATE_PER_MTOK;
+  const lower = model.toLowerCase();
+
+  const direct = MODEL_INPUT_RATES[lower];
+  if (direct !== undefined) return direct;
+
+  // Substring scan (longest key wins via insertion order — most specific first
+  // in the table above). Mirrors Python's model-tier resolution.
+  for (const [key, rate] of Object.entries(MODEL_INPUT_RATES)) {
+    if (lower.includes(key)) return rate;
+  }
+
+  return FALLBACK_INPUT_RATE_PER_MTOK;
+}
+
+/**
+ * API-equivalent dollar value of the reclaimed tokens, priced at the session's
+ * own model input rate. Returns 0 on any error (best-effort).
+ * Mirrors Python _fresh_session_savings_usd.
+ */
+export function freshSessionSavingsUsd(savedTokens: number, model?: string): number {
+  try {
+    const rate = modelInputRatePer1M(model);
+    return Math.max(0, savedTokens * rate / 1_000_000);
+  } catch {
+    return 0;
+  }
+}
+
+function intEnv(key: string, fallback: number): number {
+  const raw = process.env[key]?.trim();
+  if (!raw) return fallback;
+  const parsed = parseInt(raw, 10);
+  return isNaN(parsed) ? fallback : parsed;
+}
+
+// Env-tunable thresholds, matching Python constants.
+export const FRESH_NUDGE_QUALITY_THRESHOLD = intEnv("TOKEN_OPTIMIZER_FRESH_NUDGE_QUALITY", 70);
+export const FRESH_NUDGE_MIN_FILL_PCT = intEnv("TOKEN_OPTIMIZER_FRESH_NUDGE_MIN_FILL", 50);
+
+/** Tokens re-injected by a fresh lean-resume (the small overhead the new session pays). */
+const FRESH_NUDGE_LEAN_BLOCK_TOKENS = 1000;
+
+export interface FreshNudgeResult {
+  shouldNudge: boolean;
+  message: string | null;
+}
+
+/**
+ * Estimate tokens reclaimed by starting a fresh session now.
+ * current context size = (fillPct / 100) * contextWindow
+ * savings = current context - lean block re-injection overhead
+ *
+ * @param fillPct        0-100 (percentage, not fraction)
+ * @param model          optional model id — used only as a last-resort fallback
+ *                       when sessionWindow is unavailable
+ * @param sessionWindow  the EXACT context-window value the fill% was measured
+ *                       against (pass the same value used in computeQualityScore).
+ *                       When provided this takes priority over re-deriving from the
+ *                       model, which guarantees token count == fill% of that window
+ *                       (e.g. 54% of 1_000_000 ≈ 540K, never ~107K on a 200K fallback).
+ * @returns [savedTokens, contextWindow]
+ */
+export function freshSessionSavingsEstimate(fillPct: number, model?: string, sessionWindow?: number): [number, number] {
+  // Priority: explicit session window > model-based lookup > default fallback.
+  // Re-deriving from the model is a last resort: it can silently disagree with
+  // the window the fill % was actually computed against (e.g. 200K fallback on a
+  // 1M session makes the token estimate 5x too low).
+  const contextWindow = (sessionWindow && sessionWindow > 0)
+    ? sessionWindow
+    : contextWindowForModel(model ?? "");
+  const clampedFill = Math.max(0, Math.min(100, fillPct));
+  const currentCtx = Math.round((clampedFill / 100) * contextWindow);
+  const saved = Math.max(0, currentCtx - FRESH_NUDGE_LEAN_BLOCK_TOKENS);
+  return [saved, contextWindow];
+}
+
+/**
+ * Check whether the fresh-session nudge should fire for this turn.
+ *
+ * @param currentScore        current quality/resource-health score (0-100)
+ * @param fillPct             current context fill as 0-100 (percentage, not fraction)
+ * @param previousScore       score from the previous turn (null = no prior score yet)
+ * @param freshNudgeFired     whether the nudge already fired this session
+ * @param nudgesEnabled       whether quality nudges are enabled in config
+ * @param continuityEnabled   whether checkpoint continuity is enabled. The nudge's
+ *                            whole pitch ("start fresh, your place is saved") only
+ *                            holds when continuity actually restores the checkpoint
+ *                            in the new session. With continuity off, suppress the
+ *                            nudge so the ordinary quality nudge (/compact) takes
+ *                            over instead of promising a restore that never happens.
+ * @param model               optional model id — fallback for context-window lookup
+ * @param sessionWindow       the EXACT context-window value the fill% was measured
+ *                            against; threads through to freshSessionSavingsEstimate
+ *                            so the token count is consistent with the fill% display
+ * @param qualityThreshold    score below which (with fill) the nudge may fire; defaults
+ *                            to the env-tunable module constant, overridable via config
+ * @param minFillPct          fill% at/above which the nudge may fire; same default rule
+ */
+export function checkFreshSessionNudge(
+  currentScore: number,
+  fillPct: number,
+  previousScore: number | null,
+  freshNudgeFired: boolean,
+  nudgesEnabled: boolean,
+  continuityEnabled: boolean,
+  model?: string,
+  sessionWindow?: number,
+  qualityThreshold: number = FRESH_NUDGE_QUALITY_THRESHOLD,
+  minFillPct: number = FRESH_NUDGE_MIN_FILL_PCT,
+): FreshNudgeResult {
+  if (!nudgesEnabled) return { shouldNudge: false, message: null };
+
+  // The nudge promises "Token Optimizer has checkpointed your task, so a new
+  // session picks up where you stopped." That is only true when continuity is on.
+  // If the user disabled it, do not inject that promise into the system prompt --
+  // bail so the ordinary quality nudge handles the long+degraded session instead.
+  if (!continuityEnabled) return { shouldNudge: false, message: null };
+
+  // Post-compaction suppression: no prior score means this is a fresh/just-compacted
+  // session. Let the ordinary nudge seed the baseline first.
+  if (previousScore === null) return { shouldNudge: false, message: null };
+
+  // Once per session.
+  if (freshNudgeFired) return { shouldNudge: false, message: null };
+
+  // Both conditions must hold: long session AND degraded quality.
+  if (!(currentScore < qualityThreshold && fillPct >= minFillPct)) {
+    return { shouldNudge: false, message: null };
+  }
+
+  const [saved] = freshSessionSavingsEstimate(fillPct, model, sessionWindow);
+  const savedStr = saved >= 1000 ? `~${Math.floor(saved / 1000)}K` : `~${saved}`;
+  const fillRounded = Math.round(fillPct);
+  const scoreRounded = Math.round(currentScore);
+
+  const usd = freshSessionSavingsUsd(saved, model);
+  const costStr = usd >= 0.01 ? `, about $${usd.toFixed(2)} in API-equivalent cost` : "";
+
+  const message =
+    `[Token Optimizer] This session is long (${fillRounded}% full) and context quality has fallen to ${scoreRounded}. ` +
+    `Starting a fresh session now would reclaim ${savedStr} tokens (~${fillRounded}% of your window)${costStr}. ` +
+    `You won't lose your place: Token Optimizer has checkpointed your active task, key decisions, files, and tool results, ` +
+    `so a new session picks up exactly where you stopped. Just open one and say "continue this" — the context is rebuilt for free.`;
+
+  return { shouldNudge: true, message };
+}
