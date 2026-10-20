@@ -1,0 +1,349 @@
+---
+title: CLI reference
+description: "Complete reference for every Token Optimizer command verb, grouped by function: setup, dashboard, compaction, compression, coaching, fleet, memory, keep-warm, cache, diagnostics, and platform adapters."
+---
+
+This page lists every command the Token Optimizer engine dispatches. The engine is a single Python script, `measure.py`, that ships inside the skill. All commands run through it.
+
+## How to run a command
+
+The full invocation form is:
+
+```bash
+cd ~/.claude/skills/token-optimizer/scripts && python3 measure.py <command> [args]
+```
+
+The `cd` form is convenient, not required: the engine resolves sibling modules relative to its own script directory. You can instead pass the full path to `measure.py`. On Windows, use `python` instead of `python3`.
+
+Commands run for a non-default platform need the runtime prefix:
+
+```bash
+TOKEN_OPTIMIZER_RUNTIME=codex python3 measure.py report
+```
+
+`TOKEN_OPTIMIZER_RUNTIME` selects which platform adapter the engine targets (`claude`, `codex`, `opencode`, `copilot`, `hermes`, `cursor`, `antigravity`, `grok`). When unset, the engine defaults to Claude Code. `doctor` delegates to `codex-doctor` on Codex. On other non-Claude runtimes, Claude-targeting commands such as `report`, `quick`, and `doctor` can return a safe platform notice instead of performing the Claude audit. Use the explicit adapter doctor/summary verbs below; a runtime prefix does not make every command native.
+
+Most read commands accept `--json` for machine-readable output. The flag is noted per command where the source confirms it.
+
+## Global flags
+
+These parse before command dispatch and apply to any command in the run.
+
+| Flag | Effect | Default |
+|---|---|---|
+| `--context-size N` | Override the detected context window size for this run | Auto-detected |
+| `--json` | Emit machine-readable JSON (where the command supports it) | Off (human output) |
+| `--version`, `-v` | Print the installed version string and exit | n/a |
+
+`--context-size` can also be set with the `TOKEN_OPTIMIZER_CONTEXT_SIZE` environment variable. See [Configuration](/reference/configuration/).
+
+## Setup and install
+
+Commands that wire Token Optimizer into a platform. Plugin and marketplace installs run the hook-level setup automatically; these are for script installs, manual repair, and non-Claude platforms.
+
+| Command | Description | Key flags |
+|---|---|---|
+| `setup-hook` | Install the SessionEnd data-collection hook into `settings.json` | `--dry-run` |
+| `setup-all-hooks` | Install every Token Optimizer hook at once; idempotent, reports added and skipped counts | `--dry-run`, `--verbose`, `--json` |
+| `check-hook` | Report whether the data-collection hooks are wired | `--json` |
+| `cleanup-duplicate-hooks` | Remove hooks from `settings.json` that the installed plugin already provides | `--dry-run`, `--json` |
+| `setup-smart-compact` | Install the PreCompact checkpoint capture and SessionStart restore hooks | `--dry-run`, `--status`, `--uninstall` |
+| `setup-vscode-extension` | Manage the VS Code status-bar extension auto-install. The default reports the opt-out, the detected editor and the install state; `--install` clears the opt-out and installs now; `--uninstall` sets a sticky opt-out and removes the extension | `--status`, `--install`, `--enable`, `--uninstall` |
+| `setup-quality-bar` | Install the status-line quality bar and the quality-cache hook | `--dry-run`, `--status`, `--uninstall` |
+| `setup-daemon` | Install the persistent dashboard server (macOS launchd, Linux systemd, Windows Task Scheduler) | `--dry-run`, `--uninstall` |
+| `setup-coach-injection` | Write the COACH managed block once; does not install a recurring loop | `--uninstall` |
+| `codex-install` | Install the Codex adapter hooks and compact prompt guidance | `--project DIR`, `--profile aggressive\|balanced\|quiet\|telemetry`, `--enable-bash-compression`, `--enable-status-line`, `--uninstall`, `--dry-run` |
+| `copilot-install` | Install the GitHub Copilot adapter into `~/.copilot/hooks/` | n/a |
+| `copilot-uninstall` | Remove the Copilot adapter (only what was installed) | n/a |
+| `hermes-install` | Install Token Optimizer as a Hermes plugin into `~/.hermes/plugins/` | `--enable` |
+| `antigravity-install` | Install the Antigravity plugin into `~/.gemini/config/plugins/token-optimizer/` | n/a |
+| `antigravity-uninstall` | Remove the Antigravity plugin (only what was installed) | n/a |
+
+`setup-quality-bar --uninstall` sets a sticky `quality_bar_disabled` opt-out so the SessionStart self-healer does not reinstall the status line.
+
+## Visibility and reports
+
+The core read commands. Run `report` (or no command) for the full picture.
+
+| Command | Description | Key flags |
+|---|---|---|
+| `report` | Full per-component token breakdown with calibration-gap detection and optimization suggestions. Runs when no command is given. | n/a |
+| `quick` | Fast scan: overhead total, degradation risk, top offenders | `--json` |
+| `trends` | Per-session usage trends from history (quality, cache hit rate, cost per session) | `--days N`, `--json` |
+| `savings` | Measured token and dollar savings from active compression, split into realized, estimated, and opportunity tiers | `--days N`, `--json` |
+| `conversation` | Per-API-call breakdown for a session (input, output, cache read/write, cost, model, tools) | `[SESSION_ID]`, `--json` |
+| `compression-stats` | Per-feature compression event counts, tokens saved, average ratio, quality-preserved percentage | `--days N`, `--json` |
+| `validate-impact` | Statistical before/after validation of session efficiency | `--strategy auto\|halves`, `--days N`, `--json` |
+| `pricing-tier` | Show or set the API pricing tier used for all cost math. No argument shows current. | `[TIER_NAME]` |
+| `version` | Print the installed version string | `--version`, `-v` |
+| `security-report` | Enterprise security self-assessment (credential patterns, data locality, hook permissions) | `--json` |
+
+Pricing tiers accepted by `pricing-tier`: `anthropic` (default), `vertex-global`, `vertex-regional`, and `bedrock`. Subscription is a detected billing mode, not a settable pricing tier. See [Configuration](/reference/configuration/) for the full set.
+
+## Dashboard
+
+| Command | Description | Key flags |
+|---|---|---|
+| `dashboard` | Generate the single-file HTML dashboard; open in browser or serve over HTTP | `--serve`, `--port N`, `--host HOST`, `--quiet`, `--days N`, `--coord-path PATH` |
+| `daemon-status` | Check whether the dashboard daemon is running and identity-verified at the runtime port | n/a |
+| `daemon-consent` | Get or set consent for the persistent bookmarkable dashboard URL | `--get`, `--set yes\|no\|unset` |
+| `dashboard-diagnose` | Validate the JSON data shape injected into the dashboard; diagnoses empty-tab rendering | n/a |
+
+The default dashboard port is 24842 for Claude Code, 24843 for Codex, 24844 for Hermes, 24845 for Copilot, 24846 for Cursor, 24847 for Antigravity, and 24848 for Grok Build. The daemon serves a bookmarkable URL at `http://localhost:<port>/token-optimizer`; without the daemon, the dashboard opens from a generated file.
+
+## Compaction and continuity
+
+Checkpoint capture and restore, plus the cold-resume path for reopening a forgotten session at zero token cost.
+
+| Command | Description | Key flags |
+|---|---|---|
+| `compact-capture` | Save a checkpoint of session state (decisions, errors, agent state, open TODOs) | `--trigger auto\|stop\|stop-failure`, `--quiet`, `--budget-seconds N` (time limit, default 8, max 60) |
+| `compact-restore` | Inject the most recent checkpoint as context on a new session | `--compact`, `--new-session-only` |
+| `checkpoint-trigger` | Save a milestone checkpoint (for example before sub-agent dispatch) | `--milestone NAME`, `--quiet` |
+| `list-checkpoints` | List saved checkpoints with age and filename, newest first | n/a |
+| `checkpoint-stats` | Checkpoint telemetry summary over a day window. Requires `TOKEN_OPTIMIZER_CHECKPOINT_TELEMETRY=1`. | `--days N`, `--json` |
+| `resume-lean` | Reconstruct a lean context block from checkpoints for a cold session, zero LLM cost. Lists candidates or emits a block. | `[#\|SESSION_ID]`, `--print`, `--json`, `--days N` |
+| `prompt-continuity` | Topic-match the current prompt against prior sessions and inject a lean hint. Runs automatically via hook. | n/a |
+| `continue-last` | Render a topic-matched prior-session hint for a Codex continuation prompt | `--topic TEXT` |
+| `codex-continue-last` | Codex alias for `continue-last` | `--topic TEXT` |
+| `compact-instructions` | Generate project-specific static compact instructions; optionally install into `settings.json` | `--json`, `--install`, `--dry-run` |
+| `dynamic-compact-instructions` | Generate and inject mode-aware PRESERVE/DROP instructions at compaction time. Runs automatically via hook. | `--quiet` |
+
+## Active compression
+
+Compression and read-cache run automatically through hooks. These commands manage their state and inspect their effect.
+
+| Command | Description | Key flags |
+|---|---|---|
+| `v5` | Show, enable, or disable the active compression features; show the first-run welcome | `status`, `enable`, `disable`, `welcome`, `info`, `[FEATURE_NAME]`, `--json` |
+| `read-cache-clear` | Clear the per-session read cache (all sessions or one). Also fires on PreCompact and directory change. | `--session ID`, `--quiet` |
+| `read-cache-stats` | Show read-cache hit and miss stats | `--session ID` |
+| `cohorts` | Show live edit-rate per language and size cohort, re-promote a cohort, or force re-evaluation | `status`, `promote LANG:BAND`, `evaluate`, `--force`, `--json` |
+| `archive-result` | Archive a large tool result to disk. Runs automatically via PostToolUse hook. | `--quiet` |
+| `expand` | Retrieve a full archived tool result by id, or list all archives for a session | `TOOL_USE_ID`, `--list`, `--session SID`, `--search TEXT`, `--grep TEXT` |
+| `archive-cleanup` | Delete archived results older than 24h, or all archives for a session | `[SESSION_ID]` |
+| `structure-map` | Show the structure map (skeleton, signatures, digest) that would be generated for a file | `FILE` |
+| `structure-proof` | Replay local transcripts to simulate structure-map substitution and report would-be savings | `--json`, `--torture`, `[JSONL_PATH]` |
+
+The active compression features managed by the `v5` command are: Quality Nudges, Loop Detection, Delta Mode, Structure Map, Bash Compress, and first-read measurement/serving. Search compression shares the Bash gate; lean-output steering is not a `v5` toggle. The feature flags map to config keys and environment overrides documented in [Configuration](/reference/configuration/).
+
+## Transcript and JSONL tools
+
+| Command | Description | Key flags |
+|---|---|---|
+| `jsonl-inspect` | Show token stats, size, and structure summary for a session JSONL | `[ID\|PATH]`, `--json` |
+| `jsonl-trim` | Find or remove large tool results embedded in a session JSONL above a threshold; backs up first | `--apply`, `--threshold N`, `[ID\|PATH]` |
+| `jsonl-dedup` | Find or remove duplicate system-reminder blocks from a session JSONL | `--apply`, `[ID\|PATH]` |
+
+Both `jsonl-trim` and `jsonl-dedup` run in dry-run mode unless `--apply` is passed.
+
+## Quality and attention
+
+| Command | Description | Key flags |
+|---|---|---|
+| `quality` | Compute the 0-100 quality score for a session from 7 signals, with a quality-over-time chart | `[SESSION_ID\|current]`, `--json` |
+| `quality-cache` | Compute and cache the current session quality score (throttled). Runs automatically via hooks. | `--warn`, `--quiet`, `--throttle N`, `--force`, `--throttle-only` |
+| `status-bar` | One JSON answer for the desktop status bar: the 30-day saved total the dashboard shows, this session's savings, the cache anchor and lifetime, the last checkpoint, compactions. Answers from a cache and refreshes it in the background. | `--session ID`, `--json`, `--transcript PATH` |
+| `attention-score` | Score a markdown file against the LLM attention curve | `[FILE]`, `--json` |
+| `attention-optimize` | Propose or apply section reordering to move critical content into high-attention zones; backs up first | `[FILE]`, `--apply`, `--dry-run` |
+
+`attention-score` and `attention-optimize` default to the resolved Claude-home CLAUDE.md when no file is given, including on Codex; pass the intended AGENTS.md path explicitly. `attention-optimize` runs in dry-run mode unless `--apply` is passed.
+
+## Coaching
+
+| Command | Description | Key flags |
+|---|---|---|
+| `deterministic-candidates` | Find repeated workflow parts that could use plain code instead of model calls; read-only analysis | `--days N`, `--json`, `--budget SECONDS`, `--max-sessions N`, `--no-cache` |
+| `coach` | Generate the coaching data blob (health score, snapshot, detected patterns, questions, subagent costs) | `--json`, `--focus skills\|agentic` |
+| `inject-coach` | Inject auto-generated coaching advice into CLAUDE.md (or AGENTS.md) as a managed block with a 48h TTL | `--file PATH`, `--dry-run` |
+| `inject-routing` | Inject data-driven model-routing advice into CLAUDE.md as a managed block | `--file PATH`, `--dry-run` |
+| `route` | Recommend a model and reasoning effort for one task, in the current platform's own model names and effort knob | `--task "..."`, `--json` |
+| `check-staleness` | Remove an expired managed block; defaults to COACH, not all sections | `[COACH\|MODEL_ROUTING]` |
+
+The interactive `/token-coach` skill reads `coach --json` to drive a coaching conversation. See [Token Coach](/features/token-coach/) and [Fleet Auditor](/features/fleet-auditor/).
+
+## Memory and config health
+
+| Command | Description | Key flags |
+|---|---|---|
+| `memory-review` | Audit memory files for stale entries, size issues, and CLAUDE.md overlap; optionally archive stale entries | `--apply`, `--stale-days N`, `--project-dir PATH`, `--json` |
+| `drift` | Compare the current setup against the last snapshot and report what changed | `--json` |
+| `pin-baseline` | Build the frozen pre-install anchor to completion | n/a |
+| `git-context` | Analyze git state and suggest relevant files for the current task | `--json` |
+| `snapshot` | Take a named before or after snapshot of the current setup | `before`, `after` |
+| `set-baseline` | Inspect or set the pre-TO Opus share used to price model-routing comparisons, not the drift snapshot | `--opus N` |
+| `compare` | Compare the before and after snapshots and show the delta | n/a |
+| `skill` | Archive a skill out of the skills directory, or restore it | `archive NAME`, `restore NAME` |
+| `mcp` | Disable an MCP server (remove from settings) or re-enable it | `disable NAME`, `enable NAME` |
+
+`memory-review` is read-only unless `--apply` is passed. Stale defaults to entries older than 180 days.
+
+## Health and diagnostics
+
+| Command | Description | Key flags |
+|---|---|---|
+| `doctor` | Verify all components are correctly installed; pass, warn, or fail per component | `--json` |
+| `health` | Check the health of the current running session (fill, quality, active hooks) | n/a |
+| `health-selfcheck` | Self-test the health collection system | n/a |
+| `ensure-health` | SessionStart self-healer: repair drifted config, reinstall missing status line. Runs automatically via hook. | n/a |
+| `kill-stale` | Kill terminal sessions older than a threshold (default 12h). Orphans (terminal gone, macOS/Linux) are only ended with `--include-orphans` | `--hours N`, `--dry-run`, `--include-orphans` |
+| `plugin-cleanup` | Remove stale or orphaned plugin cache entries | `--dry-run` |
+| `counted-backfill` | Rebuild the full counted-cumulative ledger without per-pass caps; writes local history | `--quiet` |
+| `collect` | Parse session JSONL files and ingest them into the history database | `--days N`, `--quiet`, `--rebuild` |
+| `session-end-flush` | SessionEnd entry point: collect, regenerate dashboard, and capture checkpoint in one process | `--defer` |
+
+See [Health and diagnostics](/reference/diagnostics/) for an operator-focused walkthrough.
+
+## Keep-Warm
+
+Keep-Warm watching is opt-in; production LLM pings are disabled even after enable. The scheduler is macOS-only. Normal enable refuses subscription billing; `--limits-lab` is a separate CLI-only experiment, not a supported product default. See [Keep-Warm](/features/keep-warm/).
+
+| Command | Description | Key flags |
+|---|---|---|
+| `keepwarm-enable` | Enable Keep-Warm: record consent and install the scheduler on macOS | `--limits-lab` |
+| `keepwarm-disable` | Disable Keep-Warm (terminal opt-out) | n/a |
+| `keepwarm-arm` | Record a keep-warm arm record on session pause. Runs automatically via Stop hook. | `--quiet` |
+| `keepwarm-tick` | The trigger loop: evaluate armed sessions; normal production skips LLM pings. Runs every ~5 minutes via scheduler. | `--dry-run`, `--quiet` |
+| `keepwarm-scheduler` | Install, uninstall, or check the scheduler | `install`, `uninstall`, `status` |
+| `keepwarm-consent-status` | Return machine-readable consent and billing state for the first-run pitch | n/a |
+| `keepwarm-consent-asked` | Record that the keep-warm pitch was shown (idempotent) | `--quiet` |
+| `keepwarm-backfill` | Replay the keep-warm policy over real history in three modes; decide the sustain promotion fence | `--days N`, `--json`, `--no-fence` |
+| `keepwarm-report` | Full money report: mode, consent, scheduler, 7d and 30d ping/spend/realized/net, tripwire state | `--json` |
+| `keepwarm-quota-value` | Report keep-warm value in rate-limit quota for subscription users | `--json` |
+| `keepwarm-forecast` | Project savings from your own session history (probe-only, conservative). Read-only. | `--days N`, `--json` |
+
+## Cache health
+
+| Command | Description | Key flags |
+|---|---|---|
+| `cache-report` | Analyze prompt-cache expiry waste: tokens re-written after a cache window expired, per provider | `--days N`, `--fresh`, `--verbose`, `--json` |
+| `subagent-cache` | Manage the 1-hour subagent prompt-cache TTL: `status` reports state, the verdict and why, the advice line, and the net payoff estimate from your transcripts; `enable` (always unconditional, prints the estimate first) and `disable` set and undo `subagentPromptCacheTtl`; the explicit automation opt-in can also write it | `status`, `enable`, `disable`, `--json` |
+| `compact-advice` | Read-only replay of session history against candidate compact windows; recommendations never change the setting | `--days N`, `--json` |
+| `recommendations` | The daily usage-recommendations record (compact window, subagent cache lifetime): `status` (default) prints the items, the measured numbers, and any post-change wins; `refresh` re-measures now in a bounded, self-locking run. Advice only -- never writes either setting | `status`, `refresh`, `--json` |
+
+`cache-report` is an opportunity-tier signal. `--verbose` prints a per-session detail table so any headline figure traces to the sessions behind it. `--days` is clamped to the range 1 to 365.
+
+## Data and privacy
+
+| Command | Description | Key flags |
+|---|---|---|
+| `cleanup` | Remove installed components (daemon, status line, hooks, manifest entries), preserving session data/checkpoints/trends. Requires explicit confirmation | `--dry-run`, `--confirm`, `--this-install-only` |
+| `consent` | Show, grant, or reset the data-notice consent flag | `--show`, `--grant`, `--reset` |
+| `purge` | Delete the Python-managed/legacy directories listed in its dry run, not every adapter store. | `--confirm`, `--force` |
+
+`purge` lists what would be deleted on a dry run. `--confirm` deletes the history database, checkpoints, archives, and caches. `--confirm --force` also stops the daemon; `--force` alone does not authorize deletion. It never deletes host-platform transcripts. See [Your data and privacy](/reference/data-and-privacy/).
+
+## Benchmarks and proofs
+
+| Command | Description | Key flags |
+|---|---|---|
+| `benchmark` | Run the compression benchmark fixtures against the real compressor and report pass/fail | `--json` |
+| `structure-proof` | Offline structure-map proof runner (also listed under Active compression) | `--json`, `--torture` |
+
+The historical backfill analyzer is a separate script:
+
+```bash
+python3 compression_backfill.py [--write-cohorts] [--write-events] [--json]
+```
+
+See [Benchmarks](/reference/benchmarks/) for the full reproduction workflow.
+
+## Platform adapters
+
+Adapter commands target a specific platform. All require the matching `TOKEN_OPTIMIZER_RUNTIME` prefix.
+
+### Codex
+
+| Command | Description | Key flags |
+|---|---|---|
+| `codex-doctor` | Check Codex readiness (hooks, compact prompt, status line, dashboard) | `--project DIR`, `--json` |
+| `codex-compact-prompt` | Render or install the Codex compact prompt guidance | n/a |
+| `codex-status-line` | Render the Codex status line (context % and quality) | n/a |
+| `codex-state` | Dump current Codex runtime state | `--json` |
+| `codex-skill` | Disable or enable a skill in Codex | `disable\|enable NAME`, `--path PATH` |
+| `codex-mcp` | Disable or enable an MCP server in Codex | `disable\|enable NAME` |
+
+### GitHub Copilot
+
+| Command | Description | Key flags |
+|---|---|---|
+| `copilot-doctor` | Check Copilot readiness and per-source capability freshness | `--json` |
+| `copilot-home` | Print resolved Copilot home | n/a |
+| `copilot-summary` | Credits-led session summary | n/a |
+| `copilot-rollup` | Ingest recent Copilot sessions (CLI and VS Code) into the history database. Runs automatically via Stop hook. | `--quiet` |
+
+### Hermes
+
+| Command | Description | Key flags |
+|---|---|---|
+| `hermes-doctor` | Check Hermes plugin readiness | `--json` |
+| `hermes-rollup` | Ingest recent Hermes sessions into the history database. Runs automatically via Hermes hook. | `--quiet`, `--session ID`, `--days N` |
+| `hermes-summary` | Brief usage summary for recent Hermes sessions | `--quiet`, `--days N` |
+
+### Google Antigravity
+
+| Command | Description | Key flags |
+|---|---|---|
+| `antigravity-doctor` | Check Antigravity readiness (home, plugin, consent, `agy` binary, store readability, dashboard port) | `--json` |
+| `antigravity-summary` | Token and cost summary for recent Antigravity conversations | n/a |
+| `antigravity-rollup` | Ingest recent Antigravity conversations into the history database. Runs automatically via the Stop hook. | `--quiet` |
+| `antigravity-home` | Print the resolved Antigravity home (override via `TOKEN_OPTIMIZER_ANTIGRAVITY_HOME`) | n/a |
+
+### Cursor
+
+| Command | Description | Key flags |
+|---|---|---|
+| `cursor-install` | Merge the adapter into Cursor hooks | `--dry-run` |
+| `cursor-uninstall` | Remove the adapter's entries/payload, not session data | `--dry-run` |
+| `cursor-doctor` | Check readiness and optionally replay installed hook commands with synthetic payloads | `--probe`, `--json` |
+| `cursor-summary` | Read Cursor usage; no invented cost figure | n/a |
+| `cursor-rollup` | Ingest Cursor sessions into local history | `--quiet` |
+
+### Grok Build
+
+| Command | Description | Key flags |
+|---|---|---|
+| `grok-install` | Write the adapter's own Grok hooks file; refuses native Windows | `--dry-run`, `--home DIR` |
+| `grok-uninstall` | Remove only adapter hooks and payload | `--dry-run`, `--home DIR` |
+| `grok-doctor` | Check contract-only beta readiness and installed payload | `--probe`, `--json` |
+| `grok-home` | Print resolved Grok home | n/a |
+| `grok-summary` | Read Grok session tokens and trustworthy host costs | n/a |
+| `grok-rollup` | Ingest recent Grok sessions into local history | `--quiet` |
+
+Grok's five-event bridge and live-host caveats are on [Grok Build](/platforms/grok/). Pi is a separate extension with `/token-optimizer` commands, not a Python runtime; see [Pi](/platforms/pi/).
+
+### Other platforms
+
+OpenClaw and OpenCode are TypeScript plugins with their own command surfaces, not driven through `measure.py`. OpenClaw exposes `npx token-optimizer <command>` (`detect`, `scan`, `audit`, `dashboard`, `context`, `quality`, `git-context`, `drift`, `validate`, `doctor`). OpenCode exposes the `token_status` and `token_dashboard` tools inside the session. See [Platform support](/platforms/overview/) and the [capability matrix](/reference/capability-matrix/).
+
+## Legacy and internal verbs
+
+A few verbs exist for compatibility or are called only by other code paths.
+
+| Verb | Notes |
+|---|---|
+| `v5` | The `v5` prefix is a legacy name for the active compression feature manager. The features it controls are current; the name is kept for compatibility. |
+| `verbosity-steer` | UserPromptSubmit lean-output nudge; needs verified session/cache state. |
+| `daemon-revive` | Detached daemon recovery child; not a manual setup command. |
+| `runway-json` | Shared machine-readable runway snapshot for non-Python dashboards. |
+| `api-manage` | Headless skill and MCP management that the dashboard daemon shells out to: `api-manage <endpoint> <name>`, where the endpoint is `skill/archive`, `skill/restore`, `mcp/disable` or `mcp/enable`. Prints one JSON object. The verb takes no URL or token; authentication is enforced by the daemon's HTTP layer in front of it. |
+| `session-end-flush-worker` | Internal background worker forked by `session-end-flush --defer`. Not called directly. |
+
+Internal libraries (`token_estimate.py`, `session_store.py`, `compression_log.py`, `injection.py`, `context_pressure.py`, `activity_tracker.py`) are imported by the engine and are not user-invoked commands. One exception is `outline.py PATH [--json]`, which renders a bounded structure-map outline for a file in Codex contexts where the read hook cannot substitute transparently.
+
+## Devin
+
+Set `TOKEN_OPTIMIZER_RUNTIME=devin` for shared measure commands.
+
+| Command | Action |
+|---|---|
+| `devin-install [--auto \| --manual]` | Install explicit user skill and record local data consent; `--auto` also wires the automatic compression hooks, `--manual` removes them, neither keeps the active mode |
+| `devin-uninstall [--purge]` | Remove unchanged owned files and Token Optimizer's own hook entries; optional --purge also deletes metrics, consent and stored captures, preserving edited or foreign files |
+| `devin-doctor [--probe]` | Readiness, coexistence warnings and local filter probe; with automatic mode on, `--probe` proves the hook round trip |
+| `devin-summary` | Numeric output estimates, no provider totals or cost |
+| `devin-filter prepare` | Create new private stdout/stderr capture pair |
+| `devin-filter seal --capture PATH --exit-code N` | Snapshot a caller-asserted completed capture |
+| `devin-filter --stdout PATH --stderr PATH --exit-code N --session LABEL` | Filter sealed captures explicitly |
+| `devin-filter recover --capture-id ID --exit-code N` | Revalidate and recover originals without compression |
+
+The filter accepts fixed format hints: generic, git-status, git-log, listing, search, tests, build. Labels select shared compression patterns, never execute commands.

@@ -1,0 +1,51 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+.env.*
+.DS_Store
+.codex/hooks.json
+*.key
+*.pem
+*.p12
+*.crt
+*.egg-info/
+dist/
+!openclaw/dist/
+opencode/dist-bundle/
+build/
+node_modules/
+.venv/
+venv/
+snapshots/
+.pytest_cache/
+FIELD_NOTES.md
+compound-engineering.local.md
+private-review/
+docs/turboquant-enhancements.md
+docs/internal/
+docs/plans/
+OUTPUTS/
+CLAUDE.md
+skills/token-optimizer/references/roadmap.md
+signatures/
+
+# Codex marketplace sync staging dir (atomic-swap temp from sync-codex-marketplace-plugin.sh)
+plugins/.token-optimizer.stage.*
+plugins/token-optimizer/skills/token-optimizer/references/roadmap.md
+.dev/
+
+# internal design journal, never ship
+decisions.md
+
+# Devin CLI session artifacts
+.devin/
+
+# Internal working dirs — never ship
+handoff/
+scratchpad/
+.working-scratch/
+
+# token-optimizer-desktop mod: engine-generated API declarations (written at every load)
+desktop/token-optimizer-desktop/.claude-plugin/types/
+desktop/token-optimizer-desktop/node_modules/

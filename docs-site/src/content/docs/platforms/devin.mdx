@@ -1,0 +1,47 @@
+---
+title: Devin
+description: "Contract-only beta: explicit captured-output filtering through a user-triggered Devin CLI / Desktop Devin Local skill, plus an opt-in automatic mode for Devin CLI."
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+<Aside type="caution" title="Live CLI proof only">
+A live Devin CLI session exercised the documented workflow end to end. Desktop's bundled agent was exercised on macOS (skill listed and run over its ACP interface); the Desktop window itself was not. No automated live-session validation exists. Local filter tests and these sessions do not prove model adherence or delivered savings.
+</Aside>
+
+## Explicit filter by default, automatic mode opt-in
+
+Devin CLI supports command rewriting, but persistent-shell state and permission timing cannot be assumed safe for a wrapper. The default install therefore adds no lifecycle hooks and changes no permissions. `/token-optimizer-output` is user-triggered with `triggers: [user]` and stays the manual fallback.
+
+## Automatic mode
+
+`bash install.sh --devin --auto` also wires two hooks into the `hooks` key of `~/.config/devin/config.json`, so large command output is compressed automatically in Devin CLI, interactive and `-p`, with no new prompts. `--manual` removes the hooks and keeps the skill; a plain reinstall keeps the active mode. Restart running Devin sessions after installing.
+
+- Only commands your own Devin allow rules already run without a prompt are compressed. Anything Devin asks about still asks. The allow rule must be in your user-level Devin config (`~/.config/devin/config.json` or `config.local.json`); a project's `.devin/` rules can only make it stricter. Commands with unquoted globs, `~` or `#` (`ls *.txt`) run natively, untouched.
+- Known limits: any `deny` or `ask` rule on a program (even `ask Exec(git push)`) turns automatic compression off for every command of that program, by design; Devin team or enterprise policies cannot be read locally, which is what the `--auto` statement covers; on Desktop over ACP the tool card shows the wrapper command.
+- `git status --short`, `--porcelain` and `-z` run untouched. Failures, stderr and credential-looking output pass through raw.
+- Every compressed result carries a capture ID and a recover command that returns the exact original. Automatic captures are kept 7 days or 200 entries.
+- `--auto` records your statement that no Devin team or enterprise permission policy applies. Those policies are not stored locally, so they cannot be checked.
+- Uninstall and purge remove only Token Optimizer's own hook entries. A JSONC config with comments is refused; the skill still installs. Mac and Linux only.
+
+Measured live on Devin CLI 3000.11.3 (`-p` and interactive) and over ACP with both the CLI agent and the agent bundled in Devin Desktop (3000.10.48): `grep -rn` on a real repo went from 5,054 to 1,846 tokens, and a `pytest -v` run from 4,932 to 1,323 tokens, with no new prompts. A command Devin normally asks about (`docker ps -a`) still asked, showing the original command. Like Claude Code, `git log` and `find` mostly pass through uncompressed. Over ACP, Desktop's tool card shows the Token Optimizer wrapper command rather than the original.
+
+Prepare a private capture pair, run a finite foreground command in the native shell, save its real status, seal the completed captures, then filter explicitly. Redirection changes TTY/buffering behavior and loses cross-stream timing/order. Completion/status are caller assertions, not authenticated receipts; malicious same-UID producers are outside the guarantee.
+
+The filter reads only prepared owner-only regular files bounded at 8 MiB each. It refuses symlinks, hardlinks, substitutions and changed seals. Failures, stderr, invalid UTF-8/control data and recognized credentials remain raw. Raw passthrough is not redaction and can expose private content to Devin/model context. Compression is lossy.
+
+A compressed result carries an opaque capture ID. Recovery validates the pair and seal again. Compressed captures persist until explicitly cleaned up or purged; raw-passthrough captures are removed after delivery; the adapter makes no second durable raw copy. Other imported Claude hooks may make their own copies and are outside this adapter's control.
+
+## What is measured
+
+`devin-summary` reports numeric local output estimates with source `devin_captured_output_estimate` and HMAC caller correlation labels, not native Devin sessions. Estimates include the emitted recovery pointer but exclude skill/tool orchestration, duplicate invocations and recovery reads. No end-to-end savings, provider usage, quality, cost, ACU or dashboard parity is claimed.
+
+See [Devin install](/install/devin/), [Configuration](/reference/configuration/#devin), [CLI](/reference/cli/#devin) and the [capability matrix](/reference/capability-matrix/#devin).
+
+Hosted Devin has an optional manual playbook template in the repository. It is not deployed or live-tested. Knowledge/playbooks deliver instructions, not automatic interception. [Primary skill contract](https://docs.devin.ai/cli/extensibility/skills/creating-skills) and [hook contract](https://docs.devin.ai/cli/extensibility/hooks).
+
+## Desktop: Devin Local contract
+
+[Devin Local](https://docs.devin.ai/desktop/devin-local) shares the CLI harness, skills format and discovery. This adapter targets that documented contract, not Cascade or other ACP agents. On macOS with Devin Desktop 1.126.0, the app's bundled agent listed the skill from `~/.config/devin/skills/` and ran prepare, capture, seal and filter when it was invoked over the agent's ACP interface. That was two sessions on one model: a 52 KB `git log` passed through raw, and a 125 KB repetitive output was compressed to about 0.5 KB and then recovered by its capture ID. The Desktop window itself, Linux and Windows were not exercised.
+
+Select Devin Local, leave Restricted Mode, and open Customizations to check that `token-optimizer-output` loaded from the intended user skill. Invoke it explicitly. Install in the agent's actual POSIX HOME; native Windows is unsupported, and WSL does not prove Windows Desktop uses the Linux install. Doctor reports bounded metadata heuristics and local probes, not authenticated Desktop availability or execution. See [install steps](/install/devin/).

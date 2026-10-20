@@ -1,0 +1,341 @@
+---
+title: Configuration
+description: "Reference for supported Python-core controls, platform-scoped toggles, and config.json keys, with defaults and effects. Environment variables override config.json at runtime."
+---
+
+Token Optimizer reads configuration from two places: environment variables and a `config.json` file. Environment variables take precedence. When both set the same setting, the environment variable wins for that run, and `config.json` holds the persistent default.
+
+For script installs on Claude Code, `config.json` lives at `~/.claude/token-optimizer/config.json`. Plugin installs use the resolved plugin-data directory; other Python adapters use their runtime home/data directory. Do not assume every install writes the legacy Claude path. It stores feature flags, consent status, the pricing tier, and timestamps. The `v5` command and the various `setup-*` and `consent` commands write to it. Most users never edit it by hand; the commands keep it consistent.
+
+## Active compression features
+
+Each active compression feature has a `config.json` key and an environment override. Setting the environment variable to `0` disables the feature for that run regardless of the persisted value.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `TOKEN_OPTIMIZER_BASH_COMPRESS` | enabled | Set to `0` to disable Bash output compression for eligible read-only commands |
+| `TOKEN_OPTIMIZER_COMMAND_FILTERS` | `<runtime-home>/token-optimizer/command-filters.toml` | Path to a user TOML file that adds read-only commands to the compression allowlist and excludes commands you never want compressed; composes with the built-ins, safety-gated, fail-open |
+| `TOKEN_OPTIMIZER_READ_CACHE` | enabled | Set to `0` to disable the read cache entirely (no delta, no skeleton substitution) |
+| `TOKEN_OPTIMIZER_READ_CACHE_DELTA` | enabled | Set to `0` to disable delta mode only (re-reads return full content instead of a diff) |
+| `TOKEN_OPTIMIZER_READ_CACHE_MODE` | `soft_block` | Select the read-cache mode: `soft_block`, `warn`, `shadow`, or `block`. See the modes table below. |
+| `TOKEN_OPTIMIZER_STRUCTURE_MAP` | off (measurement) | Set to `beta` to enable structure-map compression event logging. This is a separate measurement toggle, not the mode selector above. |
+| `TOKEN_OPTIMIZER_QUALITY_NUDGES` | enabled | Set to `0` to disable the quality-drop alerter |
+| `TOKEN_OPTIMIZER_LOOP_DETECTION` | enabled | Set to `0` to disable the retry-loop detector |
+| `TOKEN_OPTIMIZER_FIRST_READ_SHADOW` | enabled | Set to `0` to disable both first-read skeleton measurement and active first-read skeleton serving |
+| `TOKEN_OPTIMIZER_FIRST_READ_ACTIVE` | enabled | Set to `0` to disable active first-read skeleton serving for promoted cohorts |
+| `TOKEN_OPTIMIZER_VERBOSITY_MIN_FILL` | `25` | Gentle lean-output nudge fill floor; below 75% fill it also requires session efficiency below 75. At 75-89% the strong tier uses fill alone; at 90%+ no context is added |
+
+The matching `config.json` keys are: `v5_bash_compress`, `read_cache_enabled`, `v5_delta_mode`, `v5_structure_map_beta`, `v5_quality_nudges`, `v5_loop_detection`, `v5_first_read_shadow`, and `v5_first_read_active` (the `v5_` prefix is a legacy naming convention; the features are current). Manage the `v5_` gates with `measure.py v5 enable|disable <feature>`. The read-cache master gate has its separate environment override.
+
+### Read-cache modes
+
+The read cache operates in one of four modes, selected with `TOKEN_OPTIMIZER_READ_CACHE_MODE` (for example `TOKEN_OPTIMIZER_READ_CACHE_MODE=shadow`). The default is `soft_block`.
+
+| Mode | Behavior |
+|---|---|
+| `soft_block` | Default. On an unchanged re-read, substitute a compact result (delta or structure map) instead of the full file. May deny an eligible redundant Read and inject its bounded structure map; ineligible reads pass through. |
+| `warn` | Allow the full re-read, but emit a warning that the file was already read. No substitution. |
+| `shadow` | Measure what substitution would have saved without changing the result the model sees. Used for validation. |
+| `block` | Deny redundant reads even without an eligible structure map (reason-only then); safety and escape-hatch checks still apply. This mode table describes the Python Read hook, not the separate OpenClaw config. |
+
+## Context window
+
+| Variable | Default | Effect |
+|---|---|---|
+| `TOKEN_OPTIMIZER_CONTEXT_SIZE` | auto-detected | Override the assumed context window size for all commands. Equivalent to the `--context-size` flag. |
+| `TOKEN_OPTIMIZER_QUALITY_WINDOW` | 20 | Rolling window size for ratio-based quality signals |
+| `TOKEN_OPTIMIZER_TOOL_CALL_WARN` | auto | Tool-call warning threshold; scales with the context window |
+| `TOKEN_OPTIMIZER_TOOL_CALL_CRITICAL` | auto | Tool-call critical threshold; scales with the context window |
+| `TOKEN_OPTIMIZER_RELEVANCE_THRESHOLD` | 0.3 | Minimum relevance score for collecting a checkpoint as a continuity candidate or teaser |
+| `TOKEN_OPTIMIZER_RELEVANCE_FULL_THRESHOLD` | 0.5 | Minimum relevance score for emitting the full recovered-data block instead of a one-line teaser |
+| `TOKEN_OPTIMIZER_DENSITY_MIN_MESSAGES` | 6 | Keep decision-density scoring neutral until the session has this many messages |
+| `TOKEN_OPTIMIZER_FRESH_NUDGE_QUALITY` | 70 | Quality-score threshold used by the fresh-session nudge |
+| `TOKEN_OPTIMIZER_FRESH_NUDGE_MIN_FILL` | 45 | Minimum context fill % used by the fresh-session nudge |
+
+## Checkpoints and continuity
+
+| Variable | Default | Effect |
+|---|---|---|
+| `TOKEN_OPTIMIZER_CHECKPOINT_RETENTION_DAYS` | 7 | Days to keep checkpoints before cleanup |
+| `TOKEN_OPTIMIZER_CHECKPOINT_PER_SESSION` | 5 | Newest checkpoints each session keeps, plus its newest of each trigger, so a busy session never removes another session's checkpoints |
+| `TOKEN_OPTIMIZER_CHECKPOINT_RETENTION_MAX` | 400 | Disk ceiling across all sessions; under it, each session's newest checkpoint goes last. OpenCode reads it as the number of past sessions to scan for restore (default 50 there) |
+| `TOKEN_OPTIMIZER_CHECKPOINT_TELEMETRY` | off | Set to `1` to enable the `checkpoint-stats` telemetry summary |
+| `TOKEN_OPTIMIZER_PROGRESSIVE_CHECKPOINTS` | enabled | Set to `0`, `false`, `no`, or `off` to disable progressive checkpoint capture at the 20/35/50/65/80% fill bands |
+| `TOKEN_OPTIMIZER_CHECKPOINT_FILES` | 10 | Maximum active/recent files retained in extracted checkpoint state |
+| `TOKEN_OPTIMIZER_CHECKPOINT_EVENT_MAX` | 1000 | Maximum checkpoint telemetry events retained after pruning |
+| `TOKEN_OPTIMIZER_CHECKPOINT_COOLDOWN_SECONDS` | 90 | Minimum time between checkpoint fires |
+| `TOKEN_OPTIMIZER_COMPACT_RESTORE_BUDGET` | 8 seconds | Wall-clock budget for the standalone compact-restore hook; runners also impose their shared deadline |
+| `TOKEN_OPTIMIZER_RESUME_RECENCY_MIN` | 480 minutes | Maximum age for the same-project fallback on a vague continue request; a named-topic match has its own scoring path |
+
+### Checkpoint relevance scorer
+
+These tune `checkpoint_relevance_score`, the IDF-weighted content-overlap scorer that decides which prior checkpoint (if any) a continuation prompt resumes. Every value is **hard-clamped to a safe range at load** — an out-of-range or non-numeric value is coerced into the range rather than trusted — so a mis-set knob can never force the score to a constant or flip the F1 sign. Defaults are calibrated against the real checkpoint pool; change them only with a reason.
+
+| Variable | Default | Safe range (clamped) | Effect |
+|---|---|---|---|
+| `TOKEN_OPTIMIZER_CHECKPOINT_RELEVANCE_THRESHOLD` | 0.25 | 0.1–0.9 | Minimum score for the pull tool to resume a checkpoint. Lower widens recall (risks vague-continue false matches); higher demands a stronger topical/resume signal. |
+| `TOKEN_OPTIMIZER_RELEVANCE_RESUME_BONUS_PRECISION_FLOOR` | 0.5 | 0.0–0.99 | Floor for the precision-scaled resume-intent bonus: effective factor = floor + (1−floor)·precision. Higher protects verbose genuine resumes; lower makes a cross-client graze pay more for its unmatched tokens. |
+| `TOKEN_OPTIMIZER_RELEVANCE_PATH_TF_WEIGHT` | 0.5 | 0.0–2.0 | Weight of the path-identity frequency boost (a token recurring across a checkpoint's file paths out-ranks the same word quoted once in prose). 0 disables the boost. |
+| `TOKEN_OPTIMIZER_RELEVANCE_PATH_TF_CAP` | 8 | 1–50 | Cap on the per-token path frequency counted by the boost, so one mega-repeated path segment cannot dominate recall. |
+| `TOKEN_OPTIMIZER_RELEVANCE_IDF_CAP` | 3.0 | 1.0–100.0 | Cap on each term's IDF contribution, so one ultra-rare token cannot spike the score (keyword-stuffing defense). |
+
+### Checkpoint & continuity triggers
+
+| Variable | Default | Effect |
+|---|---|---|
+| `TOKEN_OPTIMIZER_EDIT_BATCH_WRITE_THRESHOLD` | 4 | Write-count delta that triggers an edit-batch checkpoint |
+| `TOKEN_OPTIMIZER_EDIT_BATCH_FILE_THRESHOLD` | 3 | Changed-file delta that triggers an edit-batch checkpoint |
+| `TOKEN_OPTIMIZER_CONTINUITY_MAX_SESSIONS` | 5 | Maximum prior sessions represented in a continuity hint |
+| `TOKEN_OPTIMIZER_CONTINUITY_PER_SESSION_SCAN` | 3 | Maximum checkpoint candidates scanned per prior session |
+| `TOKEN_OPTIMIZER_RESUME_TOPIC_BAR` | 0.22 | Residual-topic score above which a resume request is treated as naming a topic rather than asking for the most recent same-project checkpoint |
+
+## OpenCode-only toggle names
+
+These seven names are read by `opencode/src/util/env.ts` and exist only there; the feature names also exist on other platforms, but these exact environment-variable names are not cross-platform aliases.
+
+| Variable | Default | Platform | Effect |
+|---|---|---|---|
+| `TOKEN_OPTIMIZER_SMART_COMPACTION` | true | OpenCode | Enable compaction context injection |
+| `TOKEN_OPTIMIZER_CONTINUITY` | true | OpenCode | Enable session continuity |
+| `TOKEN_OPTIMIZER_NUDGES` | true | OpenCode | Enable quality nudges |
+| `TOKEN_OPTIMIZER_ACTIVITY` | true | OpenCode | Enable activity-mode tracking |
+| `TOKEN_OPTIMIZER_TRENDS` | true | OpenCode | Enable trends collection |
+| `TOKEN_OPTIMIZER_DATA_DIR` | platform-global location + `token-optimizer/` | OpenCode | Complete data directory, used verbatim. Only the unset default appends `token-optimizer/`. See [OS defaults](/reference/data-and-privacy/#deleting-your-data). |
+| `TOKEN_OPTIMIZER_CHECKPOINT_MAX_CHARS` | 2000 | OpenCode | Maximum characters of checkpoint content injected on continuity restore |
+
+## Native adapter differences
+
+Do not apply Python defaults to the TypeScript extensions merely because an environment name is shared.
+
+| Adapter / name | Native default | Effect |
+|---|---|---|
+| OpenCode `TOKEN_OPTIMIZER_CHECKPOINT_TTL` | 300 seconds | Checkpoint TTL in the native config |
+| OpenCode `TOKEN_OPTIMIZER_CHECKPOINT_RETENTION_MAX` | 50 | Prior-session scan limit for continuity |
+| OpenCode `TOKEN_OPTIMIZER_RELEVANCE_THRESHOLD` | 0.6 | Relevance floor for restored prior-session content |
+| OpenCode `TOKEN_OPTIMIZER_FRESH_NUDGE_MIN_FILL` | 50% | Fresh-session nudge fill floor (Python default is 45%) |
+| OpenCode `TOKEN_OPTIMIZER_TOOL_CALL_WARN` / `TOKEN_OPTIMIZER_TOOL_CALL_CRITICAL` | 25 / 40 | Tool-call thresholds; explicit null plugin options disable them |
+| OpenClaw `TOKEN_OPTIMIZER_CHECKPOINT_COOLDOWN_MS` | 90000 ms | Checkpoint policy cooldown |
+| OpenClaw `TOKEN_OPTIMIZER_RUNTIME_EVALUATION_COOLDOWN_MS` | 30000 ms | Runtime checkpoint-policy evaluation cooldown |
+| OpenClaw `TOKEN_OPTIMIZER_CONTINUITY_MAX_AGE_DAYS` | 7 days | Prior-session age bound |
+| Pi `TOKEN_OPTIMIZER_PI_HOME` | `~/.pi/agent/token-optimizer` | Complete data directory, not a parent home |
+
+OpenCode plugin options can set feature gates and numeric defaults; environment reads then apply as defined by the adapter. An explicit `dataDir` option wins over its environment value. Pi persists `enabled`, `retainDays` (1-365, default 7), `archiveToolOutput`, and `continuity` in its own `settings.json`; the three boolean gates default off. OpenClaw keeps its own host/plugin config, not Python `config.json`.
+
+## Dashboard and daemon
+
+| Variable | Default | Effect |
+|---|---|---|
+| `TOKEN_OPTIMIZER_HOST` | 127.0.0.1 | Bind host for the dashboard server |
+| `TOKEN_OPTIMIZER_DASHBOARD_HOST` | 127.0.0.1 | Dashboard-specific bind host; set to `0.0.0.0` for LAN access before `setup-daemon` |
+| `TOKEN_OPTIMIZER_DASHBOARD_TIMEOUT` | 30 seconds | Total retry budget when opening the dashboard server |
+| `TOKEN_OPTIMIZER_TURN_PRELOAD_MAX` | 40 | Maximum recent sessions whose per-turn data is embedded in a static dashboard |
+| `TOKEN_OPTIMIZER_TURN_PRELOAD_MAX_BYTES` | 8000000 bytes | Skip larger transcripts during static dashboard preload; served mode fetches older/oversized sessions on demand |
+
+Dashboard ports are fixed per runtime: 24842 (Claude Code), 24843 (Codex), 24844 (Hermes), 24845 (Copilot), 24846 (Cursor), 24847 (Antigravity), 24848 (Grok Build). They are assigned by the engine. A port entry does not prove that `setup-daemon` is allowed on that runtime: it is blocked by the foreign-runtime guard for OpenCode, Copilot, Hermes, Cursor, Antigravity, and Grok. The `--port` flag on `dashboard` overrides the port for a one-off serve.
+
+## Data retention
+
+| Variable | Default | Effect |
+|---|---|---|
+| `TOKEN_OPTIMIZER_TRENDS_RETENTION_DAYS` | unlimited | Days to keep rows in the history database |
+| `TOKEN_OPTIMIZER_ARCHIVE_RETENTION_HOURS` | 24 | Hours to keep archived tool results |
+| `TOKEN_OPTIMIZER_ARCHIVE_RETENTION_MAX_FILES` | 1000 | Maximum files across tool archives; oldest sessions are removed first |
+| `TOKEN_OPTIMIZER_ARCHIVE_RETENTION_MAX_BYTES` | 104857600 | Maximum aggregate tool-archive bytes (100 MiB); oldest sessions are removed first |
+| `TOKEN_OPTIMIZER_QUALITY_CACHE_RETENTION_DAYS` | 7 | Days to keep quality-cache snapshots; `0` means unlimited |
+| `TOKEN_OPTIMIZER_ORPHAN_RETENTION_DAYS` | 30 | Minimum inactivity age for orphan plugin-data reclamation (hard floor: 7 days) |
+
+Per-session file caches are auto-deleted after 48 hours and are not configurable. See [Your data and privacy](/reference/data-and-privacy/) for the full storage map.
+
+## Desktop and terminal display
+
+| Variable | Default | Effect |
+|---|---|---|
+| `TOKEN_OPTIMIZER_STATUS_BAR` | enabled | Set to `0` to hide the desktop bar |
+| `TOKEN_OPTIMIZER_STATUS_BAR_ANIMATE` | enabled | Set to `0` to stop Clawd animation |
+| `TOKEN_OPTIMIZER_STATUS_BAR_SIZE` | full | `slim` selects an initial single-line desktop band and a slim terminal status line. A saved desktop size choice wins over this initial default |
+
+## Keep-Warm
+
+Keep-Warm is opt-in and managed by the `keepwarm-*` commands; there are no plain feature-flag environment variables for it. Consent and billing mode are persisted in `config.json` and read by `keepwarm-consent-status`.
+
+Production LLM pinging remains disabled even after consent; there is no supported environment switch here to turn it on. See [Keep-Warm](/features/keep-warm/).
+
+## Subagent prompt cache
+
+| Variable | Default | Effect |
+|---|---|---|
+| `TOKEN_OPTIMIZER_SUBAGENT_CACHE_1H` | advise-only | Unset: the `subagentPromptCacheTtl: "1h"` verdict is a recommendation only -- Token Optimizer never writes the key, it advises with your own numbers and the exact command. `1`, `true`, `on`, or `yes`: opt in to the automatic write (with the 14-day tripwire). `0`, `false`, `off`, or `no`: never, and if the setting was already applied by Token Optimizer, it is removed (Claude Code only) |
+
+Two Claude Code environment variables also gate the feature without any opt-out flag: `CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL` and `FORCE_PROMPT_CACHING_5M` both outrank the settings key, so Token Optimizer does nothing while either is set. See [Subagent prompt cache](/features/subagent-cache/).
+
+## Copilot cost rates
+
+| Variable | Default | Effect |
+|---|---|---|
+| `TOKEN_OPTIMIZER_COPILOT_USD_PER_CREDIT` | 0.01 | USD value of one Copilot AI credit, for cost display |
+| `TOKEN_OPTIMIZER_COPILOT_PREMIUM_RATE` | 0.04 | USD per premium request |
+| `TOKEN_OPTIMIZER_COPILOT_CAPS_JSON` | (unset) | JSON override of the Copilot capability map when upstream fixes outpace the shipped matrix, for example `'{"pretooluse_ctx": true}'` |
+| `TOKEN_OPTIMIZER_COPILOT_BIN` | `copilot` | Override the Copilot CLI executable used by doctor and hook-bridge checks |
+| `TOKEN_OPTIMIZER_COPILOT_HOME` | `~/.copilot` or auto-detected | Override the Copilot home used by Token Optimizer; validated before use |
+
+## Antigravity adapter
+
+| Variable | Default | Effect |
+|---|---|---|
+| `TOKEN_OPTIMIZER_ANTIGRAVITY_HOME` | `~/.gemini` | Override the Antigravity home used by the adapter; accepted only under `$HOME` |
+| `TOKEN_OPTIMIZER_ANTIGRAVITY_BIN` | first `agy` on `PATH` | Override the `agy` binary the doctor probes; must be an absolute, trusted path |
+| `TOKEN_OPTIMIZER_BASH_COMPRESS` | `1` (on) | Set `0` to disable command-output compression on Antigravity |
+
+## Pricing tier
+
+The pricing tier drives every cost and savings calculation. Set it with `measure.py pricing-tier <tier>`; the value persists in `config.json`. The default is `anthropic`.
+
+| Tier | Pricing basis |
+|---|---|
+| `anthropic` | Anthropic API direct rates (default) |
+| `vertex-global` | Google Vertex AI global rates |
+| `vertex-regional` | Vertex AI regional rates (a regional premium applies) |
+| `bedrock` | AWS Bedrock rates |
+
+
+### Price-card controls
+
+| Variable | Default | Effect |
+|---|---|---|
+| `TOKEN_OPTIMIZER_PRICES_FILE` | bundled pricing/prices.json | Override the schema-1 price-card file. Read once at import; malformed/oversized files are ignored |
+| `TOKEN_OPTIMIZER_BUNDLED_PRICES` | 1 | Set exactly 0 to skip bundled price cards and use built-in fallback rates |
+
+## Install and update
+
+| Variable | Default | Effect |
+|---|---|---|
+| `TOKEN_OPTIMIZER_RUNTIME` | claude | Select the platform adapter: `claude`, `codex`, `opencode`, `copilot`, `hermes`, `cursor`, `antigravity`, or `grok`. Pi is a separate extension, not a Python runtime value |
+| `TOKEN_OPTIMIZER_SKIP_VERIFY` | off | Set to `1` to skip checksum verification during script install (not recommended) |
+| `TOKEN_OPTIMIZER_DEBUG` | off | Emit runtime-detection and refetch-guard diagnostics to stderr |
+| `TOKEN_OPTIMIZER_NO_PROC_SCAN` | off | Skip best-effort process-tree scans used as runtime-detection fallbacks |
+| `TOKEN_OPTIMIZER_ALLOW_UNSAFE_RUNTIME_HOME` | off | For container layouts, relax only the under-`$HOME` containment check; absolute, existing, non-symlink directory checks still apply |
+| `HERMES_HOME` | ~/.hermes | Override the Hermes home directory for the Hermes adapter |
+| `TOKEN_OPTIMIZER_PYTHON` | trusted interpreter discovery | Override the Python executable used by the hook launcher on Claude Code and Codex and by the Copilot, Cursor, Antigravity, and Grok installers; the path must pass their trust checks |
+| `TOKEN_OPTIMIZER_CURSOR_HOME` | ~/.cursor | Token Optimizer-only Cursor home override; absolute safe directory under HOME by default. Cursor has no documented CURSOR_HOME alias |
+| `TOKEN_OPTIMIZER_CURSOR_BIN` | agent/cursor discovery | Override the Cursor binary probed by doctor |
+| `TOKEN_OPTIMIZER_GROK_HOME` | ~/.grok | Token Optimizer-only Grok home override, ahead of host GROK_HOME; safer than changing Grok's own home when inspecting native Windows data from WSL |
+| `TOKEN_OPTIMIZER_GROK_BIN` | PATH grok or `<grok-home>/bin/grok` | Override the binary candidate probed by the Grok doctor |
+| `TOKEN_OPTIMIZER_PI_HOME` | ~/.pi/agent/token-optimizer | Complete data directory for the separate Pi extension, used verbatim |
+| `TOKEN_OPTIMIZER_RECLAIM_ORPHANED_DATA` | off | Opt in with a truthy value to deleting eligible old orphaned plugin-data identities. Detection alone never deletes; the age floor is 7 days |
+
+## Archive and savings attribution
+
+| Variable | Default | Effect |
+|---|---|---|
+| `TOKEN_OPTIMIZER_ARCHIVE_EXEMPT_TOOLS` | (unset) | Comma-separated `fnmatch` globs added to the built-in list of MCP tools whose full output stays inline |
+| `TOKEN_OPTIMIZER_ARCHIVE_EXEMPT_DEFAULTS` | enabled | Set to `off`, `false`, `0`, or `none` to remove the built-in archive exemptions |
+| `TOKEN_OPTIMIZER_LIVE_STATE_TOOLS` | (unset) | Comma-separated `fnmatch` globs (at most 64, parsed once per process) matched against the full tool name, marking extra tools as live-state. A match does three things: the re-fetch guard never denies an identical repeat, the archive writer stores no `args_hash` fingerprint for the tool, and the archive footer invites a fresh call for current state — so a broad glob like `mcp__*` disables the whole re-fetch loop, stronger than `TOKEN_OPTIMIZER_REFETCH_GUARD_WINDOW_SECONDS=0` which only lifts the deny. Browser-family tools (chrome, playwright, puppeteer, browser, browse, chromium, devtools, computer-use keywords in either name segment, plus tool names containing screenshot, snapshot or page_state) are already covered; use this for servers with unconventional names |
+| `TOKEN_OPTIMIZER_REDACT_PATTERNS_FILE` | `<platform-home>/token-optimizer/redact-patterns.json` | Path to a JSON file of extra credential redaction patterns, added to the built-in set. See [Data and privacy](/reference/data-and-privacy/#custom-redaction-patterns) |
+| `TOKEN_OPTIMIZER_COST_PER_MTOK` | model-derived | Positive numeric override for the input-token price estimate used by the hook-safe compression-savings path |
+
+## Advanced measurement and baseline tuning
+
+These controls change estimates, cohort gates, collection bounds, or cache behavior. They are user-settable, but primarily useful for validation and advanced deployments.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `TOKEN_OPTIMIZER_OVERHEAD_CACHE_TTL` | 3600 seconds | TTL for cached structural-overhead calculations |
+| `TOKEN_OPTIMIZER_DASHBOARD_HOOK_BUDGET` | 20 seconds | Wall-clock budget for a dashboard rebuild that runs inside a hook (Stop / SessionEnd). A rebuild the budget stops is finished by a detached background process, so raising this only changes how much of the work happens inside the hook itself. Clamped to 1..600 |
+| `TOKEN_OPTIMIZER_COMPONENTS_CACHE_TTL` | 60 seconds | In-process TTL for repeated component scans |
+| `TOKEN_OPTIMIZER_LOOP_CONTINUATION_FACTOR` | 1.0 | Multiplier applied to measured looped volume for the separately labelled avoided-continuation estimate |
+| `TOKEN_OPTIMIZER_COHORT_MIN` | 3 | Minimum size for each compared cohort in contamination and retrieval estimates |
+| `TOKEN_OPTIMIZER_AVG_READ_TOKENS` | 2500 | Per-avoided-read token estimate used by retrieval savings |
+| `TOKEN_OPTIMIZER_AVOIDED_READS_CAP` | 8 | Per-session cap on avoided reads in the retrieval estimate |
+| `TOKEN_OPTIMIZER_ROUTABLE_OPUS_FRACTION` | 0.3 | Fraction of Opus work treated as routable in the model-routing opportunity calculation |
+| `TOKEN_OPTIMIZER_BASELINE_OPUS_SHARE` | 0.0 (unset) | Explicit pre-Token-Optimizer Opus share; values outside `(0, 1]` fall back to measured history |
+| `TOKEN_OPTIMIZER_AVOIDABLE_WRITE_FRACTION` | 0.3 | Share of full-file Writes treated as avoidable in the separately labelled output-waste opportunity |
+| `TOKEN_OPTIMIZER_AVOIDABLE_WRITE_TOKENS` | 1500 | Output-token delta assigned to each avoidable full-file Write opportunity |
+| `TOKEN_OPTIMIZER_CACHE_DROP_GAP_SECONDS` | 300 | Call gap treated as a likely 5-minute cache expiry in cache-drop estimates |
+| `TOKEN_OPTIMIZER_BASELINE_ONBOARDING_DAYS` | 1 | Initial install-period days excluded from baseline construction |
+| `TOKEN_OPTIMIZER_BASELINE_WINDOW_DAYS` | 30 | Early-history window used to construct the baseline |
+| `TOKEN_OPTIMIZER_BASELINE_WINSOR_PCT` | 0.99 | Percentile used to cap high-token sessions in baseline means |
+| `TOKEN_OPTIMIZER_BASELINE_MIN_SESSIONS` | 30 | Minimum sessions required for a stable early-history baseline |
+| `TOKEN_OPTIMIZER_AFTER_MIN_SESSIONS` | 10 | Minimum recent sessions required before trusting the after-window comparison |
+| `TOKEN_OPTIMIZER_MIN_INPUT_TOKENS` | 1000 | Minimum input tokens for a session to enter the interactive-work comparison pool |
+| `TOKEN_OPTIMIZER_MIN_DURATION_MINUTES` | 1.0 | Minimum duration for a session to enter the interactive-work comparison pool |
+| `TOKEN_OPTIMIZER_INITIAL_BACKFILL_DAYS` | 365 | Lookback used by the one-time deep session-history backfill |
+| `TOKEN_OPTIMIZER_COLLECT_COMMIT_BATCH` | 200 | Number of collected sessions committed per backfill batch |
+| `TOKEN_OPTIMIZER_COLLECT_MAX_PER_RUN` | 150 | Maximum newly parsed sessions per collection run; `0` is unbounded |
+| `TOKEN_OPTIMIZER_INITIAL_BACKFILL_MAX_ATTEMPTS` | 5 | Maximum deep-backfill attempts before returning to the rolling window |
+| `TOKEN_OPTIMIZER_BASELINE_ADOPT` | enabled | Set exactly 0 to prevent adopting a well-formed frozen baseline from a prior sibling plugin identity |
+| `TOKEN_OPTIMIZER_WEIGHT_MIN_ANCHOR_SESSIONS` | 100 | Minimum anchor-session sample for the session-weight measuring-stick pool |
+| `TOKEN_OPTIMIZER_STRUCTURE_MAP_TREESITTER` | off | Truthy value enables the optional tree-sitter backend when compatible runtime and grammar packages are installed |
+| `TOKEN_OPTIMIZER_FAIL_STREAK_THRESHOLD` | 3 | Different-output failures of the same command before the thrash burn nudge |
+| `TOKEN_OPTIMIZER_INLINE_SCRIPT_THRESHOLD` | 8 | Repeated executions of a normalized inline script before its thrash nudge (bodies at least 300 characters) |
+| `TOKEN_OPTIMIZER_ARCHIVE_ACTIVE_GRACE_SECONDS` | 86400 seconds | Archive heartbeat grace protecting recently active sessions during aggregate retention |
+| `TOKEN_OPTIMIZER_ARCHIVE_CLEANUP_INTERVAL_SECONDS` | 60 seconds | Minimum interval between recursive archive retention scans |
+
+## Supported controls versus implementation markers
+
+The tables document supported configuration and adapter-specific overrides. Child-process markers, generated-script constants, test fixtures, and unsupported experimental switches are not setup steps or tuning controls. Do not copy a name from a debug log into your environment unless its adapter documentation supports that use.
+
+## config.json keys
+
+The keys below cover the primary feature controls, not every internal cache, timestamp, or consent field. Edit through the commands rather than by hand; the table documents what each key holds.
+
+| Key | Holds | Set by |
+|---|---|---|
+| `v5_bash_compress` | Bash compression on/off | `v5 enable\|disable bash_compress` |
+| `read_cache_enabled` | Read cache on/off | Persisted config; per-run `TOKEN_OPTIMIZER_READ_CACHE=0` disables |
+| `v5_delta_mode` | Delta mode on/off | `v5 enable\|disable delta_mode` |
+| `v5_structure_map_beta` | Structure-map event logging on/off | `v5 enable\|disable structure_map_beta` |
+| `v5_quality_nudges` | Quality nudges on/off | `v5 enable\|disable quality_nudges` |
+| `v5_loop_detection` | Loop detection on/off | `v5 enable\|disable loop_detection` |
+| `v5_first_read_shadow` | First-read measurement gate | `v5 enable\|disable first_read_shadow` |
+| `v5_first_read_active` | Promoted first-read serving gate | `v5 enable\|disable first_read_active` |
+| `quality_bar_disabled` | Sticky status-line opt-out | `setup-quality-bar --uninstall` |
+| `enterprise_consent_shown`, `v5_welcome_shown` | Notice/opt-out flags; missing or unreadable config fails open, not an affirmative consent barrier | Welcome bootstrap and `consent --grant\|--reset` |
+| daemon consent | Bookmarkable-URL preference | `daemon-consent --set` |
+| `pricing_tier` | Active pricing tier | `pricing-tier <tier>` |
+| `keepwarm_consent` and billing mode | Keep-Warm enablement state | `keepwarm-enable`, `keepwarm-disable` |
+
+## Host settings Token Optimizer reads
+
+These are the behavior-driving host settings covered by this audit, not an exhaustive host schema or keys in Token Optimizer's `config.json`. Reading them does not mean Token Optimizer implements or controls every host feature.
+
+| Host / key | How Token Optimizer uses it |
+|---|---|
+| Claude `model`, `primaryModel`, `defaultModel` | Model/window detection and routing advice |
+| Claude `autoCompactWindow` | Top-level compact window; read for fill and compact-window replay, never written by recommendations |
+| Claude `modelSettings[model-id].autoCompactWindow` | Per-model setting written by `/autocompact`; takes precedence over top-level. `"auto"` selects the tuned default instead of falling through |
+| Claude `subagentPromptCacheTtl` | Read for advice; only explicit enable or `TOKEN_OPTIMIZER_SUBAGENT_CACHE_1H=1` can set `"1h"` in user settings. User/managed/project overrides are preserved |
+| Claude `env` | Host-injected overrides and custom redaction/filter configuration |
+| Claude `permissions`, `hooks`, `statusLine`, `enabledPlugins`, `compactInstructions`, `cleanupPeriodDays` | Audit, safe hook/status-line setup, compaction instructions, retention inspection |
+| Claude `mcpServers`, `_disabledMcpServers`, `includeGitInstructions`, `effortLevel` | MCP inventory/toggles and coaching |
+| Codex `model`, `project_doc_max_bytes`, `project_doc_fallback_filenames` | Model detection and AGENTS.md footprint calculation |
+| Codex `permissions.filesystem.deny_read` | Excludes forbidden paths from scans |
+
+### Host environment overrides
+
+| Name | Effect in Token Optimizer |
+|---|---|
+| `CLAUDE_CODE_AUTO_COMPACT_WINDOW` | Wins over per-model and top-level compact-window settings. Valid explicit windows clamp to 100K-1M and the model limit |
+| `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` | Used-percent threshold applied to the resolved compact window; 1 to below 100 compacts earlier. Read-only: Token Optimizer does not delete it |
+| `CLAUDE_CODE_DISABLE_1M_CONTEXT` | Exact `1` forces the per-model window resolver to 200K, ahead of its window overrides |
+| `CLAUDE_MODEL`, `ANTHROPIC_MODEL`, `CODEX_MODEL` | Model hints where no stronger session model is available |
+| `CLAUDE_CODE_DISABLE_MCP_DEFERRED` | Exact `1` disables the deferred-tool assumption in MCP overhead estimation |
+| `CLAUDE_CODE_SAVE_HOOK_ADDITIONAL_CONTEXT` | Read-hook persistence signal used by substitution safety/logging |
+| `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `HERMES_HOME` | Host-home discovery; validated by the relevant adapter |
+| `CLAUDE_PLUGIN_DATA`, `CLAUDE_PLUGIN_ROOT`, `CLAUDE_SESSION_ID` | Host-supplied plugin/session identity, not recommended user tuning knobs |
+| `GROK_HOME` | Grok's own home; prefer `TOKEN_OPTIMIZER_GROK_HOME` for a Token Optimizer-only override |
+| `MAX_MCP_OUTPUT_TOKENS` | Host output cap used for MCP cap-proximity estimates, not changed by the archiver |
+
+The effective compact window resolves host env, then per-model settings, then top-level settings, then the model's tuned default (about 967K for native 1M). The used-percent override is applied afterward. Context-size overrides and `CLAUDE_CODE_DISABLE_1M_CONTEXT` affect the model limit separately. This is not the generic config.json precedence below.
+
+## Precedence summary
+
+1. Precedence is feature-specific. The per-model window resolver checks `CLAUDE_CODE_DISABLE_1M_CONTEXT`, then `TOKEN_OPTIMIZER_CONTEXT_SIZE`, then `--context-size`; do not assume a CLI flag always beats env.
+2. Environment variables win over `config.json` for the run.
+3. `config.json` holds the persistent default.
+4. Engine defaults apply when nothing else is set.
+
+A value marked `(verify)` anywhere in these docs means the source did not state that detail definitively. Defaults here are source-derived, not proof of live host behavior; beta adapters still require their documented verification.
+
+## Devin
+
+`TOKEN_OPTIMIZER_RUNTIME=devin` isolates shared dispatch from Claude scans. `TOKEN_OPTIMIZER_DEVIN_HOME` overrides the adapter's home; otherwise absolute `XDG_CONFIG_HOME/devin` or `~/.config/devin` is used. Overrides must remain inside HOME and cannot traverse symlinks. Native Windows is refused. Only output filtering is supported (explicit by default, automatic with `install.sh --devin --auto`), not generic dashboard/trends commands. Automatic mode edits only the `hooks` key of `config.json` in that home; automatic captures are kept 7 days or 200 entries. Numeric estimate retention is 30 days with at most 10,000 rows. Raw-passthrough captures are removed after successful delivery; compressed captures remain available for recovery until explicitly deleted or purged.

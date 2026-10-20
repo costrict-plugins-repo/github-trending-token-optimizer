@@ -1,0 +1,125 @@
+---
+title: Bash output compression
+description: "A PreToolUse hook rewrites verbose read-only CLI output into compact summaries before it reaches the model, while preserving credentials verbatim. A 564-token pytest run becomes 115 tokens."
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Bash output compression intercepts safe, read-only CLI commands and replaces their verbose output with a compact summary, so routine `git status`, `pytest`, and lint runs stop flooding your context.
+
+## What it does
+
+![Bash output compression: a verbose command condensed to a compact summary, credentials preserved](/images/bash-compression.svg)
+
+
+Many commands produce far more output than the model needs to act. A test run prints every passing case; a lint run repeats the same rule across hundreds of lines; a directory listing scrolls for pages. Bash output compression catches these through the PreToolUse Bash hook and routes them through a compressor that keeps the signal and drops the repetition. A 564-token pytest run becomes about 115 tokens. Savings depend on command mix and whether the output is eligible; fixture ratios are not universal session coverage.
+
+The hook only touches commands it recognizes as safe and read-only. Anything ambiguous passes through untouched and full.
+
+## Handler families
+
+The compressor has a dedicated handler per command family, so each kind of output is summarized the way that family needs.
+
+| Family | Covers | How it compresses |
+|---|---|---|
+| Version control | `git status`, `git diff`, `git log` | Counts and groups instead of full listings; default-format `git log` becomes one line per commit |
+| Path lists | `find` | Grouped by directory with counts; large and noise directories collapsed; total always stated |
+| Test runners | `pytest`, plus cypress, playwright, mocha, karma routed through the same path | Failures and summary, passing cases collapsed |
+| Lint | eslint, ruff, flake8, shellcheck, rubocop, golangci-lint | Grouped by rule code |
+| Listings | `ls`, `pip list`, `npm ls`, `docker ps` | Top-N with a tail marker |
+| Logs | log tails | Adjacent duplicate lines collapsed |
+| Build | JS/TS and Go build output | Errors and summary view |
+| Misc | `tree`, `docker pull` | Depth truncation, progress filtering |
+
+A second PostToolUse pass covers build, test, and run commands that are not read-only (gcc, cargo, npm, make, go, mvn, and more). The command already ran, so the hook collapses repetition in the captured output while preserving every distinct error line, exit status, and summary. A credential-redacted, size-capped recovery copy is archived behind an expand pointer.
+
+## When it fires
+
+Automatically, on the PreToolUse Bash hook, when you run a recognized read-only command. The hook tokenizes the command with `shlex.split()`, checks it against a whitelist, and rewrites the output through the compression wrapper. Commands it does not recognize run normally with full output. Build and test commands are compressed PostToolUse on the not-read-only branch, after the command has executed.
+
+## Default state
+
+On by default on Claude Code (CLI and VS Code). Approximated or unavailable on platforms with reduced PreToolUse hook support; see the [capability matrix](/reference/capability-matrix/).
+
+## How to turn off
+
+For a single run or in CI, set the environment variable:
+
+```bash
+TOKEN_OPTIMIZER_BASH_COMPRESS=0 python3 measure.py report
+```
+
+To persist the change:
+
+```bash
+cd ~/.claude/skills/token-optimizer/scripts
+python3 measure.py v5 disable bash_compress
+```
+
+The variable and its config key are defined in the [configuration reference](/reference/configuration/).
+
+## Security model
+
+The wrapper applies fixed command safety gates. Credential preservation is pattern-based, not a guarantee for every secret shape.
+
+- **No shell execution.** `shell=True` is never used. Commands are parsed with `shlex.split()`, not run through a shell.
+- **Compound commands excluded.** Anything containing `;`, `&&`, `||`, a pipe, `$()`, backticks, `>`, or `>>` is categorically skipped, along with `sudo` and interactive flags. Only single, safe, read-only commands are eligible.
+- **Credentials preserved verbatim.** Output is scanned for credential patterns before compression, and any match is kept intact. The scan covers AWS keys, GitHub personal access tokens, Slack tokens, Stripe keys, OpenAI keys, and HTTP basic-auth URLs. A secret in command output is never summarized away.
+- **Errors survive.** Multilingual error lines are routed through the preservation path. Partial output from a timed-out command is returned raw, never compressed.
+
+<Aside type="caution">
+Compression applies only to recognized safe commands. If you need the complete, untouched output of a recognized command for one call, disable compression for that run with `TOKEN_OPTIMIZER_BASH_COMPRESS=0`.
+</Aside>
+
+## Custom filters (TOML)
+
+The 111 built-in commands cover most verbose CLI output, but you can extend the allowlist with your own read-only commands, and exclude commands you never want compressed, without touching the code. Point Token Optimizer at a TOML file:
+
+- Default location: `<runtime-home>/token-optimizer/command-filters.toml`
+- Override the path with `TOKEN_OPTIMIZER_COMMAND_FILTERS`
+
+```toml
+# Add a read-only command to an existing compression handler.
+# handler must be one of the built-in pattern names (pytest, lint, ls, ...).
+[filters.add]
+my-tests = { command = "cargo test", handler = "pytest" }
+my-lint  = { command = "ruff check", handler = "lint" }
+
+# Exclude commands from compression (glob patterns supported).
+[filters.exclude]
+commands = ["git status", "ls -la"]
+```
+
+Your filters **compose with** the built-ins rather than replacing them. Built-in detection always runs first, so an `add` entry only extends the set, never overrides a built-in handler for the same command.
+
+The safety model is immutable and enforced in the hook and dispatch code, so user config cannot widen it. The loader rejects an `add` entry that names a shell interpreter (`bash`, `python`, `node`, ...), a privilege-escalation wrapper (`sudo`, `su`, `doas`), a destructive write subcommand (`rm`, `chmod`, `dd`, ...), or any command containing shell metacharacters (`;`, `|`, `$`, ...). A malformed file fails open: filters are skipped and the built-ins keep working.
+
+## Defaults and thresholds
+
+| Setting | Value |
+|---|---|
+| Default state | On |
+| Eligible commands | Recognized read-only commands only |
+| Compound commands | Always excluded |
+| Credential handling | Scanned and preserved verbatim |
+| Timeout output | Returned raw, uncompressed |
+| Command coverage | Built-in allowlist plus safety-checked user additions; workload-dependent |
+
+## Risk rating
+
+Low. The hook fails open: unrecognized commands, compound commands, and timed-out commands all return full output. The narrow risk is a recognized command whose summary omits a detail the model needed, which you resolve by disabling compression for that one run. Credentials and errors are explicitly preserved, so the failure mode is missing verbosity, not missing safety information.
+
+## Related environment variables
+
+`TOKEN_OPTIMIZER_BASH_COMPRESS` and the config key `v5_bash_compress`, plus `TOKEN_OPTIMIZER_COMMAND_FILTERS` to point at a custom [filter file](#custom-filters-toml). Defined in the [configuration reference](/reference/configuration/).
+
+## Platform availability
+
+Full on Claude Code CLI and VS Code. Other platforms vary with their PreToolUse Bash hook support; see the [capability matrix](/reference/capability-matrix/).
+
+## Related pages
+
+- [Active compression](/features/active-compression/): the suite this belongs to.
+- [Read cache](/features/read-cache/): the same idea for file re-reads.
+- [Trust and safety](/concepts/trust-and-safety/): why nothing in your context gets edited or removed.
+- [Configuration reference](/reference/configuration/): the canonical variable table.
