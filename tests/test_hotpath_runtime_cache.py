@@ -1,0 +1,499 @@
+#!/usr/bin/env python3
+"""Hot-path latency tests for the shared process snapshot + negative-result
+ancestor-scan cache and the run.py runtime export.
+
+What changed:
+- runtime_env._load_proc_snapshot(): ONE `ps -Ao pid=,ppid=,comm=,args=`
+  snapshot per process, shared by the OpenCode (args) and Copilot (comm)
+  ancestor scanners, which previously spawned one `ps` each.
+- runtime_env._opencode_in_process_tree(): persists a NEGATIVE scan result to
+  a short-TTL disk cache keyed by parent pid + parent start time (Linux
+  /proc only) + runtime-signal env signature so subsequent hook processes
+  skip the scan. Only negatives are cached, so a stale entry can never flip
+  a Claude/Codex session into another runtime. On Linux the start-time
+  binding prevents PID reuse from flipping an OpenCode session into claude.
+- hooks/run.py: exports detect_runtime()'s resolution to the dispatched child
+  via TOKEN_OPTIMIZER_RUNTIME so the child (whose parent is the ephemeral
+  dispatcher, making its own cache useless) never re-scans.
+
+Contracts guarded here:
+1. Snapshot parse correctness for both scanners (comm vs args columns).
+2. Negative result is cached; a cache hit spawns no `ps`.
+3. A POSITIVE finding is never cached (re-derived live every scan).
+4. Cache is invalidated by a different env signature.
+5. Expired entries (TTL) are ignored.
+6. TOKEN_OPTIMIZER_NO_PROC_SCAN disables both the scan and cache writes.
+7. detect_runtime() honors an exported TOKEN_OPTIMIZER_RUNTIME without any
+   process scan (the run.py child contract).
+8. A failing `ps` behaves as "no ancestor found" and never raises.
+9. PID reuse with a different parent start time does not suppress a live
+   OpenCode ancestor (the cache key binds to the parent's incarnation).
+10. Same parent start time (same incarnation) still allows a cache hit.
+
+Run directly:  python3 tests/test_hotpath_runtime_cache.py
+Exits non-zero on first failure.
+"""
+
+import json
+import os
+import sys
+import tempfile
+import time
+from pathlib import Path
+from unittest import mock
+
+import pytest
+
+REPO = Path(__file__).resolve().parent.parent
+SCRIPTS = REPO / "skills" / "token-optimizer" / "scripts"
+sys.path.insert(0, str(SCRIPTS))
+
+import runtime_env  # noqa: E402
+
+# Every env var the ancestor cache key hashes — cleared before each case.
+_CONTROLLED_ENV = (
+    "TOKEN_OPTIMIZER_RUNTIME",
+    "CLAUDE_PLUGIN_ROOT",
+    "CLAUDE_PLUGIN_DATA",
+    "CLAUDECODE",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_SESSION_ID",
+    "CODEX_HOME",
+    "HERMES_HOME",
+    "COPILOT_HOME",
+    "TOKEN_OPTIMIZER_COPILOT_HOME",
+    "TOKEN_OPTIMIZER_NO_PROC_SCAN",
+    "OPENCODE_BIN",
+    "OPENCODE_CONFIG_DIR",
+    "OPENCODE_DATA_DIR",
+    "OPENCODE_CONFIG",
+    "OPENCODE_CLIENT",
+    "XDG_CACHE_HOME",
+)
+
+# Fake process tree used as the ps output: the walk starts at FAKE_PID.
+_FAKE_PID = 5000
+_FAKE_PARENT = 4000
+_FAKE_GRANDPARENT = 3000
+
+# On Windows there is no `ps` to snapshot, so runtime_env deliberately disables
+# the whole process-tree scan (_load_proc_snapshot: ``disabled`` when
+# sys.platform starts with "win"). The scan/cache-mechanics tests below require
+# a real ps and are skipped there; the remaining tests (explicit override,
+# explicit TOKEN_OPTIMIZER_NO_PROC_SCAN, and ps failure) still run on Windows
+# and cover the platform-disabled contract. This is a per-test skip on the
+# POSIX-only mechanics, NOT a blanket skip of the file.
+_PLATFORM_DISABLES_PROC_SCAN = sys.platform.startswith("win")
+_requires_ps = pytest.mark.skipif(
+    _PLATFORM_DISABLES_PROC_SCAN,
+    reason="shared ps snapshot is platform-disabled on Windows (no ps); "
+           "scan/cache mechanics are POSIX-only",
+)
+
+
+def _ps_table(*rows):
+    """Build ps output; each row is (pid, ppid, comm, args).
+
+    A row for the walked pid (_FAKE_PID) is always included so the parent
+    chain exists; pass its (pid, ppid, comm, args) as the first row.
+    """
+    base = [(1, 0, "/sbin/launchd", "/sbin/launchd")]
+    return "\n".join(
+        f"{pid:>6} {ppid:>6} {comm} {args}".rstrip() for pid, ppid, comm, args in [*base, *rows]
+    ) + "\n"
+
+
+def _hook_chain(parent_comm="bash", parent_args="/bin/bash"):
+    """Rows for the walked pid and its parent (no opencode/copilot ancestor)."""
+    return [
+        (_FAKE_PID, _FAKE_PARENT, "python3", "python3 run.py"),
+        (_FAKE_PARENT, 1, parent_comm, parent_args),
+    ]
+
+
+class _FakeProc:
+    def __init__(self, stdout="", returncode=0):
+        self.stdout = stdout
+        self.stderr = ""
+        self.returncode = returncode
+
+
+class _Controlled:
+    """Clean signal env + isolated cache dir + fresh runtime_env state."""
+
+    def __init__(self, env=None):
+        self.env = env or {}
+
+    def __enter__(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.saved = {k: os.environ.get(k) for k in _CONTROLLED_ENV}
+        for k in _CONTROLLED_ENV:
+            os.environ.pop(k, None)
+        os.environ["XDG_CACHE_HOME"] = str(Path(self.tmp.name) / "cache")
+        for k, v in self.env.items():
+            os.environ[k] = v
+        runtime_env._PROC_SCAN_SNAPSHOT = None
+        runtime_env.detect_runtime.cache_clear()
+        return self
+
+    def __exit__(self, *exc):
+        for k, v in self.saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        runtime_env._PROC_SCAN_SNAPSHOT = None
+        runtime_env.detect_runtime.cache_clear()
+        self.tmp.cleanup()
+
+    def cache_file(self):
+        return Path(self.tmp.name) / "cache" / "token-optimizer" / "ancestor-scan-v2.json"
+
+    def v1_cache_file(self):
+        return Path(self.tmp.name) / "cache" / "token-optimizer" / "ancestor-scan.json"
+
+
+def _patch_ps(table="", returncode=0):
+    """Patch subprocess.run (the local import inside _load_proc_snapshot
+    resolves the real module) and os.getpid (the walk starts there)."""
+    calls = {"n": 0}
+
+    def fake_run(*args, **kwargs):
+        calls["n"] += 1
+        return _FakeProc(table, returncode)
+
+    p1 = mock.patch("subprocess.run", side_effect=fake_run)
+    p2 = mock.patch.object(runtime_env.os, "getpid", return_value=_FAKE_PID)
+    p1.start()
+    p2.start()
+    return calls, (p1, p2)
+
+
+def _stop(patch_pair):
+    for p in patch_pair:
+        p.stop()
+
+
+@_requires_ps
+def test_snapshot_shared_by_both_scanners():
+    """One ps spawn serves both the OpenCode (args) and Copilot (comm) scans."""
+    with _Controlled():
+        table = _ps_table(
+            (_FAKE_PID, _FAKE_PARENT, "python3", "python3 run.py"),
+            (_FAKE_PARENT, _FAKE_GRANDPARENT, "bash", "/bin/bash -c echo hi"),
+            (_FAKE_GRANDPARENT, 1, "zsh", "-l"),
+        )
+        calls, patches = _patch_ps(table)
+        try:
+            assert runtime_env._opencode_in_process_tree() is False
+            assert runtime_env._ancestor_in_process_tree(frozenset({"zsh"})) is True
+            assert runtime_env._ancestor_in_process_tree(frozenset({"copilot"})) is False
+            assert calls["n"] == 1, f"expected 1 ps spawn, got {calls['n']}"
+        finally:
+            _stop(patches)
+
+
+@_requires_ps
+def test_opencode_ancestor_found_via_args_column():
+    """OpenCode launched through node is recognized from the args column."""
+    with _Controlled():
+        table = _ps_table(
+            (_FAKE_PID, _FAKE_PARENT, "python3", "python3 run.py"),
+            (_FAKE_PARENT, 1, "node", "node /opt/x/node_modules/opencode-ai/dist/index.js"),
+        )
+        _, patches = _patch_ps(table)
+        try:
+            assert runtime_env._opencode_in_process_tree() is True
+        finally:
+            _stop(patches)
+
+
+@_requires_ps
+def test_negative_scan_is_cached_and_skips_ps():
+    """A negative OpenCode scan writes the cache; the next process skips ps."""
+    with _Controlled() as ctx:
+        table = _ps_table(*_hook_chain())
+        calls, patches = _patch_ps(table)
+        try:
+            assert runtime_env._opencode_in_process_tree() is False
+            assert calls["n"] == 1
+        finally:
+            _stop(patches)
+        assert ctx.cache_file().is_file(), "negative result not persisted"
+        # Fresh process state (new snapshot) — the cache must answer alone.
+        runtime_env._PROC_SCAN_SNAPSHOT = None
+        calls2, patches2 = _patch_ps(table)
+        try:
+            assert runtime_env._opencode_in_process_tree() is False
+            assert calls2["n"] == 0, "cache hit must not spawn ps"
+        finally:
+            _stop(patches2)
+
+
+@_requires_ps
+def test_positive_finding_is_never_cached():
+    """An opencode ancestor is re-derived live; nothing is persisted."""
+    with _Controlled() as ctx:
+        table = _ps_table(
+            (_FAKE_PID, _FAKE_PARENT, "python3", "python3 run.py"),
+            (_FAKE_PARENT, 1, "node", "node /opt/x/node_modules/opencode-ai/dist/index.js"),
+        )
+        _, patches = _patch_ps(table)
+        try:
+            assert runtime_env._opencode_in_process_tree() is True
+        finally:
+            _stop(patches)
+        assert not ctx.cache_file().exists(), "positive finding must not be cached"
+
+
+@_requires_ps
+def test_cache_invalidated_by_env_signature():
+    """A different runtime-signal env must not consume another env's negative."""
+    with _Controlled():
+        table = _ps_table(*_hook_chain())
+        calls, patches = _patch_ps(table)
+        try:
+            assert runtime_env._opencode_in_process_tree() is False
+            runtime_env._PROC_SCAN_SNAPSHOT = None
+            os.environ["CLAUDECODE"] = "1"  # different signal env -> different key
+            assert runtime_env._opencode_in_process_tree() is False
+            assert calls["n"] == 2, "changed env signature must re-scan"
+        finally:
+            _stop(patches)
+
+
+@_requires_ps
+def test_expired_cache_entry_is_ignored():
+    with _Controlled() as ctx:
+        table = _ps_table(*_hook_chain())
+        calls, patches = _patch_ps(table)
+        try:
+            assert runtime_env._opencode_in_process_tree() is False
+            cache = ctx.cache_file()
+            data = json.loads(cache.read_text())
+            stale = time.time() - (runtime_env._ANCESTOR_CACHE_TTL_SECONDS + 5)
+            data["entries"] = {k: stale for k in data["entries"]}
+            cache.write_text(json.dumps(data))
+            runtime_env._PROC_SCAN_SNAPSHOT = None
+            assert runtime_env._opencode_in_process_tree() is False
+            assert calls["n"] == 2, "expired entry must re-scan"
+        finally:
+            _stop(patches)
+
+
+@_requires_ps
+def test_parallel_sessions_do_not_evict_each_other():
+    """Two host sessions (different parent pids) each keep their negative.
+
+    The v1 cache held one entry, so session B's write evicted session A's and
+    A's next hook re-ran ps. Both must now hit."""
+    with _Controlled():
+        table = _ps_table(*_hook_chain())
+        calls, patches = _patch_ps(table)
+        try:
+            for ppid in (4001, 4002):
+                with mock.patch.object(runtime_env.os, "getppid", return_value=ppid):
+                    runtime_env._PROC_SCAN_SNAPSHOT = None
+                    assert runtime_env._opencode_in_process_tree() is False
+            assert calls["n"] == 2
+            for ppid in (4001, 4002):
+                with mock.patch.object(runtime_env.os, "getppid", return_value=ppid):
+                    runtime_env._PROC_SCAN_SNAPSHOT = None
+                    assert runtime_env._opencode_in_process_tree() is False
+            assert calls["n"] == 2, "a second session's write evicted the first's negative"
+        finally:
+            _stop(patches)
+
+
+@_requires_ps
+def test_v1_and_v2_copies_do_not_overwrite_each_other():
+    """An older plugin copy still writes the v1 single-entry file. v2 must
+    neither read it nor touch it, so the two never thrash one file."""
+    with _Controlled() as ctx:
+        v1 = ctx.v1_cache_file()
+        v1.parent.mkdir(parents=True, exist_ok=True)
+        v1_payload = json.dumps({"version": 1, "key": runtime_env._ancestor_cache_key(), "ts": time.time()})
+        v1.write_text(v1_payload)
+        table = _ps_table(*_hook_chain())
+        calls, patches = _patch_ps(table)
+        try:
+            assert runtime_env._opencode_in_process_tree() is False
+            assert calls["n"] == 1, "a v1 entry must not satisfy the v2 cache"
+            runtime_env._PROC_SCAN_SNAPSHOT = None
+            assert runtime_env._opencode_in_process_tree() is False
+            assert calls["n"] == 1, "v2 entry written after the miss must hit"
+        finally:
+            _stop(patches)
+        assert v1.read_text() == v1_payload, "v2 must leave the v1 file alone"
+        assert json.loads(ctx.cache_file().read_text())["version"] == runtime_env._ANCESTOR_CACHE_VERSION
+
+
+@_requires_ps
+def test_v1_payload_at_v2_path_reads_as_one_miss_then_is_rewritten():
+    """A v1-shaped payload (or any foreign shape) at the v2 path is one miss,
+    then the file is rewritten in v2 format and the next process hits."""
+    with _Controlled() as ctx:
+        path = ctx.cache_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"version": 1, "key": runtime_env._ancestor_cache_key(), "ts": time.time()}))
+        table = _ps_table(*_hook_chain())
+        calls, patches = _patch_ps(table)
+        try:
+            assert runtime_env._opencode_in_process_tree() is False
+            assert calls["n"] == 1
+            data = json.loads(path.read_text())
+            assert data["version"] == runtime_env._ANCESTOR_CACHE_VERSION
+            assert runtime_env._ancestor_cache_key() in data["entries"]
+            runtime_env._PROC_SCAN_SNAPSHOT = None
+            assert runtime_env._opencode_in_process_tree() is False
+            assert calls["n"] == 1, "rewritten v2 file must hit"
+        finally:
+            _stop(patches)
+
+
+@_requires_ps
+def test_cache_entries_are_bounded():
+    with _Controlled() as ctx:
+        table = _ps_table(*_hook_chain())
+        calls, patches = _patch_ps(table)
+        try:
+            for ppid in range(5000, 5000 + runtime_env._ANCESTOR_CACHE_MAX_ENTRIES + 10):
+                with mock.patch.object(runtime_env.os, "getppid", return_value=ppid):
+                    runtime_env._PROC_SCAN_SNAPSHOT = None
+                    runtime_env._opencode_in_process_tree()
+        finally:
+            _stop(patches)
+        data = json.loads(ctx.cache_file().read_text())
+        assert len(data["entries"]) == runtime_env._ANCESTOR_CACHE_MAX_ENTRIES
+        assert ctx.cache_file().stat().st_size <= runtime_env._MAX_CACHE_BYTES
+
+
+@_requires_ps
+def test_pid_reuse_does_not_suppress_live_opencode_ancestor():
+    """A stale negative from a prior incarnation (different parent start time)
+    must not suppress a live OpenCode ancestor scan when the PID is reused.
+
+    This is the brief's top concern (runtime misdetection via PID reuse).
+    On Linux the cache key includes /proc/<ppid>/stat starttime, so a reused
+    PID with a different incarnation produces a different key. On non-Linux
+    the start time is "" for both incarnations, so the test mocks
+    _parent_starttime to simulate the Linux behavior portably.
+    """
+    with _Controlled() as ctx:
+        # Phase 1: prior Claude session writes a negative cache entry with
+        # parent start time "1000" (old incarnation).
+        table_no_opencode = _ps_table(*_hook_chain())
+        with mock.patch.object(runtime_env, "_parent_starttime", return_value="1000"):
+            calls, patches = _patch_ps(table_no_opencode)
+            try:
+                assert runtime_env._opencode_in_process_tree() is False
+                assert calls["n"] == 1
+            finally:
+                _stop(patches)
+        assert ctx.cache_file().is_file(), "negative result not persisted"
+
+        # Phase 2: PID is reused by a new OpenCode session. The parent start
+        # time is now "2000" (new incarnation). The cache key differs, so the
+        # stale entry is a miss and the live scan runs, finding the opencode
+        # ancestor.
+        table_with_opencode = _ps_table(
+            (_FAKE_PID, _FAKE_PARENT, "python3", "python3 run.py"),
+            (_FAKE_PARENT, 1, "node", "node /opt/x/node_modules/opencode-ai/dist/index.js"),
+        )
+        runtime_env._PROC_SCAN_SNAPSHOT = None
+        with mock.patch.object(runtime_env, "_parent_starttime", return_value="2000"):
+            calls2, patches2 = _patch_ps(table_with_opencode)
+            try:
+                assert runtime_env._opencode_in_process_tree() is True, (
+                    "PID reuse with different start time must re-scan and find the opencode ancestor"
+                )
+                assert calls2["n"] == 1, "stale cache from prior incarnation must not suppress scan"
+            finally:
+                _stop(patches2)
+
+
+@_requires_ps
+def test_same_start_time_allows_cache_hit():
+    """When the parent start time is unchanged (same incarnation), the cache
+    hit still works — the start-time binding does not break the normal cache."""
+    with _Controlled() as ctx:
+        table = _ps_table(*_hook_chain())
+        with mock.patch.object(runtime_env, "_parent_starttime", return_value="1000"):
+            calls, patches = _patch_ps(table)
+            try:
+                assert runtime_env._opencode_in_process_tree() is False
+                assert calls["n"] == 1
+            finally:
+                _stop(patches)
+        assert ctx.cache_file().is_file()
+        runtime_env._PROC_SCAN_SNAPSHOT = None
+        with mock.patch.object(runtime_env, "_parent_starttime", return_value="1000"):
+            calls2, patches2 = _patch_ps(table)
+            try:
+                assert runtime_env._opencode_in_process_tree() is False
+                assert calls2["n"] == 0, "same start time must allow cache hit"
+            finally:
+                _stop(patches2)
+
+
+def test_no_proc_scan_disables_scan_and_cache_write():
+    with _Controlled(env={"TOKEN_OPTIMIZER_NO_PROC_SCAN": "1"}) as ctx:
+        calls, patches = _patch_ps()
+        try:
+            assert runtime_env._opencode_in_process_tree() is False
+            assert calls["n"] == 0
+            assert not ctx.cache_file().exists(), "disabled scan must not write cache"
+        finally:
+            _stop(patches)
+
+
+def test_exported_runtime_override_skips_scan():
+    """run.py child contract: TOKEN_OPTIMIZER_RUNTIME resolves with zero ps."""
+    with _Controlled(env={"TOKEN_OPTIMIZER_RUNTIME": "claude"}):
+        calls, patches = _patch_ps()
+        try:
+            assert runtime_env.detect_runtime() == "claude"
+            assert calls["n"] == 0, "override tier must resolve before any scan"
+        finally:
+            _stop(patches)
+
+
+def test_ps_failure_behaves_as_no_ancestor():
+    """A failing ps yields empty tables: no ancestor found, no crash."""
+    with _Controlled():
+        _, patches = _patch_ps("", returncode=1)
+        try:
+            assert runtime_env._opencode_in_process_tree() is False
+            assert runtime_env._ancestor_in_process_tree(frozenset({"bash"})) is False
+        finally:
+            _stop(patches)
+
+
+# The direct-runner path mirrors the pytest skipif above; keep this list in
+# sync with the tests carrying @_requires_ps.
+_REQUIRE_PS = frozenset({
+    "test_snapshot_shared_by_both_scanners",
+    "test_opencode_ancestor_found_via_args_column",
+    "test_negative_scan_is_cached_and_skips_ps",
+    "test_positive_finding_is_never_cached",
+    "test_cache_invalidated_by_env_signature",
+    "test_expired_cache_entry_is_ignored",
+    "test_pid_reuse_does_not_suppress_live_opencode_ancestor",
+    "test_same_start_time_allows_cache_hit",
+})
+
+
+if __name__ == "__main__":
+    failures = 0
+    for name, fn in sorted(globals().items()):
+        if name.startswith("test_") and callable(fn):
+            if _PLATFORM_DISABLES_PROC_SCAN and name in _REQUIRE_PS:
+                print(f"SKIP {name} (ps unavailable on this platform)")
+                continue
+            try:
+                fn()
+                print(f"PASS {name}")
+            except AssertionError as exc:
+                failures += 1
+                print(f"FAIL {name}: {exc}")
+    sys.exit(1 if failures else 0)
