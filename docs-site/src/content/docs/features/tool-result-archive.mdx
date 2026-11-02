@@ -1,0 +1,106 @@
+---
+title: Tool result archive and expand
+description: "Large tool results get a capped, credential-redacted recovery copy. Eligible MCP results get an inline preview/pointer, retrievable with expand."
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+The tool result archive saves a capped, credential-redacted recovery copy of large tool outputs. Eligible MCP results get an inline preview/pointer; other covered tools keep their original inline output. Retrieval remains possible while the stored copy survives retention.
+
+## What it does
+
+A single large tool result, a 200KB grep or a long file read, can be discarded the next time the session compacts, taking information the model still needed with it. The archive prevents that. When a tool returns a result at or above 4,096 characters, the PostToolUse hook writes a bounded, credential-redacted copy to disk keyed by its `tool_use_id`, then, for eligible MCP tools, replaces the inline result with a preview and retrieval pointer. Bash/PowerShell, Read, Glob, Grep, and Agent results are archived for recovery without this general MCP replacement; Bash compression has its own output-replacement path. The pointer carries an inline hint the model can act on: it names the `expand` command and the id to retrieve the full result later.
+
+This is a durability feature, not primarily a savings feature. The pointer is smaller than the original, so there is an incidental context reduction, but the purpose is keeping large results recoverable across compaction rather than shrinking them. The saved copy is credential-redacted. Results above 5,242,880 characters are truncated with a visible marker, so `expand` cannot recover the discarded tail. Agent results and exempt MCP tools keep their full inline output; their archive copy is still available for recovery.
+
+<Aside type="note" title="Durability, not savings">
+Archiving stores a recovery copy; eligible MCP results also get a preview/pointer. Treat the token reduction as a side effect. The point is that a result you may need after `/compact` is still there, addressable by id, instead of gone.
+</Aside>
+
+## The model-actionable inline hint
+
+The pointer left in context is written for the model, not just for you. It states the `tool_use_id` and the exact `expand` invocation, so when the model later realizes it needs the full output, it can issue the retrieval itself without guessing. The hint is what makes the archive usable mid-session rather than only a manual recovery tool.
+
+When the model knows *what* it needs but not *which* archived result holds it, `expand --search` runs a full-text search over the archived output (SQLite FTS5, with a plain-text fallback) and returns the matching chunk, so it recovers one relevant result instead of re-loading everything.
+
+## When it fires
+
+Automatically, on the PostToolUse hook, for any tool result at or above the size threshold, subject to eligibility and safety guards. It covers Bash, PowerShell, Read, Glob, Grep, Agent, and MCP results. Eligible MCP output can be replaced; archive exemptions keep the inline result intact. Retrieval with `expand` is manual: it runs only when the model or you call it.
+
+## Default state
+
+On by default on Claude Code (CLI and VS Code), through the PostToolUse hook. On platforms with reduced PostToolUse hook support, archiving is approximated or unavailable; the [capability matrix](/reference/capability-matrix/) lists the per-platform reality.
+
+## How to turn it on and off
+
+Archiving runs through the PostToolUse hook. To stop it, remove the hook wiring for your platform (see the [hooks reference](/reference/hooks/)). `expand` and `archive-cleanup` are read-and-maintenance commands that run only when invoked, so there is nothing to disable about them. An archive you forget about does not persist either way: the archiver and manual `archive-cleanup` command both use the 24-hour default, adjustable with `TOKEN_OPTIMIZER_ARCHIVE_RETENTION_HOURS`.
+
+## Exact commands
+
+```bash
+cd ~/.claude/skills/token-optimizer/scripts
+
+# Retrieve a full archived result by its tool_use_id
+python3 measure.py expand TOOL_USE_ID
+
+# Retrieve from a specific session
+python3 measure.py expand TOOL_USE_ID --session SESSION_ID
+
+# List every archived result for the session
+python3 measure.py expand --list
+
+# List archives for a specific session
+python3 measure.py expand --list --session SESSION_ID
+
+# Find an archived result by keyword instead of re-loading everything
+python3 measure.py expand --search "connection refused"
+python3 measure.py expand --search "stack trace" --session SESSION_ID
+
+# Manually archive the current pending result (normally automatic)
+python3 measure.py archive-result
+
+# Delete archives older than 24h (default; TOKEN_OPTIMIZER_ARCHIVE_RETENTION_HOURS
+# overrides), or all archives for one session
+python3 measure.py archive-cleanup
+python3 measure.py archive-cleanup SESSION_ID
+```
+
+On non-Claude platforms, prefix the runtime selector:
+
+```bash
+TOKEN_OPTIMIZER_RUNTIME=codex python3 measure.py expand --list
+```
+
+## Defaults and thresholds
+
+| Setting | Value |
+|---|---|
+| Archive threshold | Results at or above 4,096 characters |
+| Tools covered | Bash, PowerShell, Read, Glob, Grep, Agent, MCP |
+| Saved-copy cap | 5,242,880 characters, with a truncation marker |
+| Aggregate limits | 1,000 files / 100 MiB by default; oldest inactive sessions first |
+| Inline replacement | Eligible non-exempt MCP tools; Agent results are archive-only |
+| Trigger | Automatic on PostToolUse |
+| Retrieval | Manual (`expand`) |
+| Auto-purge | After 24 hours, applied when the hook writes a new archive or the session-end worker runs |
+| Manual purge | `archive-cleanup`: older than 24 hours by default (`TOKEN_OPTIMIZER_ARCHIVE_RETENTION_HOURS` overrides), or all archives for one session |
+
+## Risk rating
+
+Low. The archive writes the full result to a local file before replacing it inline, with credential redaction and a size cap; redacted credentials and a tail beyond the cap cannot be recovered. The realistic failure is the model not retrieving an archived result it needed, which the inline hint is built to prevent by naming the exact `expand` command and id. Automatic and manual cleanup share the 24-hour default; a result you still need beyond that window should be saved out of the archive explicitly.
+
+## Related environment variables
+
+`TOKEN_OPTIMIZER_RUNTIME` selects the platform whose hooks and archive location are used. `TOKEN_OPTIMIZER_ARCHIVE_RETENTION_HOURS` sets the shared age cutoff for automatic and manual cleanup (default 24). Both are defined in the [configuration reference](/reference/configuration/).
+
+## Platform availability
+
+Full on Claude Code CLI and VS Code. Other platforms vary with their PostToolUse hook support; see the [capability matrix](/reference/capability-matrix/).
+
+## Related pages
+
+- [Active compression](/features/active-compression/): the suite this belongs to.
+- [Read cache](/features/read-cache/): shrinks file re-reads rather than archiving results.
+- [Smart compaction](/features/smart-compaction/): what the archive lets results survive.
+- [Hooks reference](/reference/hooks/): the PostToolUse wiring that drives archiving.
+- [Configuration reference](/reference/configuration/): the canonical variable table.

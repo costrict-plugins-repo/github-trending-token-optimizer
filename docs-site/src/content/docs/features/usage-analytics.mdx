@@ -1,0 +1,157 @@
+---
+title: Usage and session analytics
+description: "Read how your sessions actually behave over time: trends, measured savings, per-turn cost, model mix, skill adoption, and whether any sessions are stale or zombied."
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Usage analytics turn the session data Token Optimizer already collects into answers about how you work: which sessions cost the most, what your compression has saved, which models and skills you actually use, and whether any running sessions have gone stale. Reports use local transcripts and analysis stores. Collection/refresh can update local state, pricing-tier can write settings, and kill-stale can end processes.
+
+## What it does
+
+Each time a session ends, Token Optimizer parses its transcript and ingests the result into a local SQLite history database (`trends.db`). Usage analytics query that store. They surface patterns you cannot see from a single session: cost drifting up week over week, a skill that loads on every start but never gets used, a model you reach for more than you meant to.
+
+The analytics split into two jobs. The reporting commands (`trends`, `savings`, `conversation`, `pricing-tier`) answer "how have my sessions behaved." The session-health commands (`health`, `kill-stale`) answer "are my running sessions in a clean state right now." Neither runs a model, but `kill-stale` ends eligible processes when invoked without `--dry-run`, and `pricing-tier <tier>` writes the persistent pricing choice. They are not all read-only.
+
+## Trends
+
+`trends` reports per-session usage from the history database over a window of days. Each row carries the session's quality score, cache hit rate, cost, model mix, and the skills it loaded, so a single report shows both your spend curve and what drove it.
+
+```bash
+cd ~/.claude/skills/token-optimizer/scripts
+python3 measure.py trends            # default window
+python3 measure.py trends --days 30  # widen the window
+python3 measure.py trends --json     # machine-readable
+```
+
+Two columns are easy to overlook and worth reading. **Model mix** shows which models a session invoked, so you can see whether expensive models are doing cheap work. **Skill adoption** shows which installed skills a session actually loaded, which exposes skills that add startup overhead on every session without earning it.
+
+<Aside type="note" title="History needs collecting first">
+Trends are empty until sessions have been ingested. The SessionEnd hook ingests automatically for plugin users. Skill-only users install the data-collection hook once with `setup-hook`, or backfill existing transcripts with `python3 measure.py collect --rebuild`.
+</Aside>
+
+## Savings
+
+`savings` reports the measured token and dollar savings from every active compression feature, kept in three separate tiers so the headline number stays honest.
+
+- **Realized** savings are what compression has already saved on real sessions.
+- **Estimated** savings are modeled where a direct measurement is not available.
+- **Opportunity** savings are what you could recover but have not, such as prompt-cache expiry waste.
+
+The three tiers are reported apart so an opportunity figure never inflates the realized headline. The report also cross-references savings from subagent dispatch.
+
+```bash
+cd ~/.claude/skills/token-optimizer/scripts
+python3 measure.py savings            # measured, estimated, and opportunity tiers
+python3 measure.py savings --days 30
+python3 measure.py savings --json
+```
+
+## Per-turn cost
+
+`conversation` breaks a single session into its individual API calls. Each row shows input tokens, output tokens, cache read and cache write, dollar cost, the model used, and the tools invoked on that turn. This is the view for finding the one expensive turn in an otherwise cheap session.
+
+```bash
+cd ~/.claude/skills/token-optimizer/scripts
+python3 measure.py conversation             # the current or most recent session
+python3 measure.py conversation SESSION_ID  # a specific session
+python3 measure.py conversation --json
+```
+
+Cost figures depend on the pricing tier, covered next.
+
+## Model-specific price cards
+
+The engine loads the bundled `pricing/prices.json` once at import, with built-in tables as fallback. A malformed/missing file does not prevent reporting. Price changes can arrive in a release without editing this page; inspect the active tier and the per-turn report rather than assuming every model uses one flat rate.
+
+Haiku 5.5 uses the long-context card when the full per-request prompt (fresh input plus cache reads and writes) exceeds 100K tokens; that card is 5x its base rates. Other native-1M Claude models do not get that surcharge. GPT-5.6 Sol has a date-gated promotion before November 21, 2026 UTC. These are API-equivalent estimates, not proof of a subscription bill or savings caused by Token Optimizer.
+
+## Pricing tier
+
+Every cost and savings figure is computed against a pricing tier. `pricing-tier` sets which one. Set it to match how you are billed so estimates use the matching rate table. They remain API-equivalent figures, not a verified bill.
+
+```bash
+cd ~/.claude/skills/token-optimizer/scripts
+python3 measure.py pricing-tier                  # show the current tier
+python3 measure.py pricing-tier vertex-global    # switch tiers
+```
+
+Accepted tiers: `anthropic` (default), `vertex-global`, `vertex-regional`, and `bedrock`. The choice persists in `config.json`. Subscription is a billing mode Token Optimizer detects on its own, so you never set it as a tier. On a subscription the meaningful unit is **how much work fits inside the plan you already paid for**. A flat fee buys a rate-limit budget; every token Token Optimizer keeps out of context, and a user-selected turn moved to a lighter model, is budget you get to spend on real work instead. That is why subscription reporting leads with **runway**, how much longer your 5-hour and 7-day windows last, rather than a per-token price. Runway converts to money the moment a window runs out, because finishing the work then means paying for overage or API calls on top of the subscription. See [Keep-Warm quota value](/features/keep-warm/#the-subscription-quota-value-story).
+
+## Session health
+
+`health` checks the sessions running on your machine right now and flags the ones that are not in a clean state. It reads process and elapsed-time data; it does not touch the history database.
+
+| Flag | Condition | Meaning |
+|---|---|---|
+| `STALE` | Process running longer than 24 hours | May be abandoned; process age alone does not prove it |
+| `ZOMBIE` | Process running longer than 48 hours | Very likely abandoned |
+| `OUTDATED` | Session version differs from installed | Running against an older Token Optimizer |
+| `TERMINAL` | Has an attached terminal | Informational, not a problem |
+| `HEADLESS` | A terminal CLI process with no terminal attached | Might be a background agent running on purpose |
+| `DESKTOP` | Hosted by another program: the Claude desktop app, an IDE, the SDK, a headless `-p` run, or a subcommand such as `mcp` | Never ended by `kill-stale` |
+| `UNVERIFIED` | Identity could not be established (parent chain unreadable, or the terminal or shell is gone without meeting every `ORPHAN` condition) | Never ended by `kill-stale` |
+| `ORPHAN` | macOS/Linux: terminal gone, parent is the init process, exact argv readable | Listed as "terminal gone; started started &lt;age&gt; agolt;agestarted &lt;age&gt; agogt; ago". Never ended by default; see `--include-orphans` below |
+
+```bash
+cd ~/.claude/skills/token-optimizer/scripts
+python3 measure.py health                  # flag stale, zombie, and outdated sessions
+python3 measure.py kill-stale --dry-run    # preview which sessions would be killed
+python3 measure.py kill-stale --hours 24   # kill sessions running longer than 24h
+python3 measure.py kill-stale --include-orphans --dry-run   # also preview orphans (terminal gone)
+```
+
+`health` only reports. `kill-stale` is the action: it terminates terminal sessions (a process positively identified as a CLI attached to a terminal under a shell, tmux/screen or sshd) that have been running longer than a threshold. `DESKTOP` and `UNVERIFIED` sessions are never terminated, and it never ends the conversation it is run from. The threshold defaults to 12 hours, and `--dry-run` shows the kill list without acting. Orphaned sessions are never ended by default: `kill-stale` prints how many it left alone and the exact command, and `--include-orphans` ends them (same `--hours` threshold, each re-verified right before the kill).
+
+<Aside type="caution" title="kill-stale ends processes">
+`kill-stale` terminates running processes. Always run it with `--dry-run` first to confirm the list, especially if you keep long-lived sessions open on purpose.
+</Aside>
+
+## When to use it
+
+On demand. Every command here is a read or, in the single case of `kill-stale`, an explicit action you invoke. None fires automatically except the underlying data collection on SessionEnd, which only populates the database the reports read.
+
+## Default state
+
+`trends`, `savings`, `conversation`, and `health` are reports. `pricing-tier` is read-only without an argument, but writes the selected tier when one is supplied. Data collection that feeds them is on by default for plugin users through the SessionEnd hook. `kill-stale` never runs on its own.
+
+Platform availability: the reports run anywhere Token Optimizer collects session history. Session health (running-process flags) is most complete on POSIX systems; on Windows without a process creation-time source, sessions are flagged `UNKNOWN_AGE` rather than mislabeled fresh. See the [capability matrix](/reference/capability-matrix/).
+
+## How to turn it off
+
+Nothing to disable for the reports; they only read history you already have, so to stop seeing them, do not run them. `kill-stale` only acts when you call it.
+
+To stop the data collection that feeds the reports, remove the SessionEnd data-collection hook. Skill-only users who installed it manually run `setup-hook` to inspect the hook; plugin users manage it through the plugin. To delete the collected history entirely, use `purge`. See [your data and privacy](/reference/data-and-privacy/).
+
+## Defaults and thresholds
+
+| Setting | Default | Notes |
+|---|---|---|
+| Trends/savings window | recent days | Widen with `--days N` |
+| Pricing tier | `anthropic` | Persisted in `config.json` |
+| `STALE` flag | idle > 24h | Reported by `health` |
+| `ZOMBIE` flag | idle > 48h | Reported by `health` |
+| `kill-stale` threshold | 12 hours | Override with `--hours N` |
+| Savings accounting | realized, estimated, opportunity | Three separate tiers |
+| Data collection | on (SessionEnd hook) | Backfill with `collect --rebuild` |
+
+## Risk rating
+
+None for the reports: they read the local history database and the running process list, and change nothing. Low for `kill-stale`, which terminates processes; its only failure mode is ending a session you wanted to keep, which `--dry-run` exists to prevent.
+
+## Related environment variables
+
+The pricing tier is set with the `pricing-tier` command rather than an environment variable, and persists in `config.json`. Dashboard host variables affect where trends render when served. All are defined in the [configuration reference](/reference/configuration/).
+
+## Platform availability
+
+Reports run on Claude Code, Codex, Copilot, Hermes, OpenCode, and OpenClaw wherever session history is collected. Running-process session health is fullest on POSIX. See the [capability matrix](/reference/capability-matrix/).
+
+## Related
+
+- [The dashboard](/features/dashboard/): trends and session health visualized in one place.
+- [Cache TTL watchdog](/features/cache-watchdog/): the opportunity-tier prompt-cache waste behind the savings report.
+- [Keep-Warm](/features/keep-warm/): the subscription quota-value report for flat-rate plans.
+- [Quality scoring](/concepts/quality-scoring/): what the quality column in a trends row means.
+- [CLI reference](/reference/cli/): every reporting and session-health verb.
+- [Configuration](/reference/configuration/): pricing tiers and dashboard host settings.
