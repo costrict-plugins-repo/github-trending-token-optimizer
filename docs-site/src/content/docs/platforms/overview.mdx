@@ -1,0 +1,41 @@
+---
+title: Platform support
+description: "Platform support: Token Optimizer ships a native adapter per platform, with Claude Code as the reference surface."
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Token Optimizer has adapters for the coding platforms below, plus a separate experimental Pi extension. Each platform gets its own adapter built against that platform's real hook API, not a lowest-common-denominator wrapper. Where an upstream API cannot do something, the page for that platform names the gap and the reason instead of pretending parity.
+
+## Supported platforms
+
+Claude Code is the reference platform. Every feature ships there first, and every other platform page describes its capabilities relative to it.
+
+| Platform | Surfaces | Status |
+|---|---|---|
+| [Claude Code](/platforms/claude-code/) | CLI, VS Code extension | Stable |
+| [Codex](/platforms/codex/) | CLI, Desktop | Stable |
+| [OpenCode](/platforms/opencode/) | Plugin | Stable |
+| [OpenClaw](/platforms/openclaw/) | Plugin | Stable |
+| [Hermes](/platforms/hermes/) | Slash command, CLI | Beta |
+| [GitHub Copilot](/platforms/copilot/) | CLI, VS Code | Beta |
+| [Cursor](/platforms/cursor/) | IDE (Composer), CLI | Beta |
+| [Google Antigravity](/platforms/antigravity/) | CLI, App, IDE | Beta |
+| [Grok Build](/platforms/grok/) | CLI | Contract-only beta; live host unverified |
+| [Devin](/platforms/devin/) | CLI / Desktop Devin Local explicit output skill, opt-in automatic mode on the CLI; hosted manual template | Contract-only beta; live CLI workflow exercised; Desktop's bundled agent exercised on macOS, Desktop window not |
+| [Pi](/platforms/pi/) | Extension | Experimental; opt-in measurement, unverified Git-source install |
+| [Cowork](/platforms/cowork/) | Plugin, org console or personal upload | Experimental |
+
+Claude Cowork runs the same Claude Code engine in a VM, so it is not a separate runtime. It reaches Cowork sessions through the org plugin console rather than a local install, and it packages an intended hook subset for probe verification in Cowork. It is experimental and not yet verified on a live build. See the [Cowork page](/platforms/cowork/) for the distribution path and the hook set.
+
+The VS Code companion extension that surfaces Claude Code data also runs in Cursor and Devin (formerly Windsurf), because both are VS Code forks. That covers the editor status bar only. A standalone Cursor adapter with its own hook integration now ships in beta (see the [Cursor page](/platforms/cursor/)); a Devin CLI output-filter skill now ships as a contract-only beta, with an opt-in automatic mode (`install.sh --devin --auto`) and without editor parity.
+
+## Native per platform, not a shim
+
+Each adapter maps Token Optimizer features onto the host's own primitives. Codex reads `AGENTS.md` where Claude Code reads `CLAUDE.md`. Hermes opens its session database read-only because that is the access Hermes grants plugins. Copilot bills in AI Credits, so cost figures use Copilot's own numbers rather than a token estimate. Antigravity decodes its per-conversation SQLite store read-only and prices sessions at Gemini list rates unless Antigravity reports its own credit figure.
+
+The result is honest asymmetry. A feature that depends on a hook the platform does not expose is marked unavailable on that platform, with the upstream blocker named.
+
+## Compare every feature
+
+The full grid of which feature works on which surface, including approximated and unavailable cells, lives at [/reference/capability-matrix/](/reference/capability-matrix/).

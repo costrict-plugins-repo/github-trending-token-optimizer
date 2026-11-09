@@ -1,0 +1,95 @@
+{
+  "name": "token-optimizer-statusline",
+  "displayName": "Token Optimizer",
+  "description": "See your Claude Code, GitHub Copilot, or Cursor context health, efficiency, and usage limits in the VS Code status bar.",
+  "version": "0.1.19",
+  "publisher": "alexgreensh",
+  "license": "PolyForm-Noncommercial-1.0.0",
+  "icon": "icon.png",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/alexgreensh/token-optimizer.git",
+    "directory": "vscode-extension"
+  },
+  "homepage": "https://github.com/alexgreensh/token-optimizer",
+  "categories": [
+    "Other",
+    "Visualization"
+  ],
+  "keywords": [
+    "claude",
+    "claude-code",
+    "copilot",
+    "cursor",
+    "token",
+    "context",
+    "status bar"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "tokenOptimizer.showStatus",
+        "title": "Token Optimizer: Show Status Panel"
+      },
+      {
+        "command": "tokenOptimizer.openDashboard",
+        "title": "Token Optimizer: Open Dashboard"
+      },
+      {
+        "command": "tokenOptimizer.refresh",
+        "title": "Token Optimizer: Refresh Now"
+      }
+    ],
+    "configuration": {
+      "title": "Token Optimizer",
+      "properties": {
+        "tokenOptimizer.runtime": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "claude",
+            "copilot",
+            "cursor"
+          ],
+          "enumDescriptions": [
+            "Detect automatically: read whichever runtime (Claude Code, GitHub Copilot, or Cursor) you've used most recently. Single-runtime setups just work; no setting to flip.",
+            "Always read cache files written by the Claude Code Token Optimizer plugin (~/.claude/token-optimizer/).",
+            "Always read cache files written by the GitHub Copilot Token Optimizer install (~/.copilot/token-optimizer/). Requires a Copilot Token Optimizer installation.",
+            "Always read session tallies written by the Cursor Token Optimizer hooks (~/.cursor/token-optimizer/sessions/). Requires a Cursor Token Optimizer installation."
+          ],
+          "default": "auto",
+          "markdownDescription": "Which AI coding assistant runtime to read Token Optimizer data from. **auto** (default) picks whichever of Claude Code, GitHub Copilot, or Cursor you used most recently. Set it explicitly to `claude`, `copilot`, or `cursor` to pin one. Changing this setting takes effect immediately without reloading VS Code."
+        },
+        "tokenOptimizer.staleAfterSeconds": {
+          "type": "number",
+          "default": 180,
+          "markdownDescription": "How many seconds before verified statusline usage-limit data is shown as cached. Cached values show their update age; manual refresh also tries a local transcript estimate."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run clean && npm run compile",
+    "clean": "node -e \"require('fs').rmSync('out', { recursive: true, force: true })\"",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "test": "vitest run --config vitest.cursor.config.mts",
+    "package": "vsce package --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.0",
+    "@types/vscode": "^1.80.0",
+    "typescript": "^5.4.0",
+    "vitest": "4.1.11"
+  },
+  "overrides": {
+    "vite": "6.4.3"
+  }
+}
